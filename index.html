@@ -1,0 +1,325 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Опора</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Prata&family=Manrope:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --sand:#F6EAE3; --rose:#EAC6BD; --clay:#C98F82; --sky:#E6E2E6;
+    --ink:#3D2E2C; --muted:#8A716C; --sage:#98AC96;
+    --glass:rgba(255,255,255,.55); --edge:rgba(255,255,255,.75);
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0;min-height:100%}
+  body{
+    font-family:'Manrope',system-ui,sans-serif;font-size:16px;line-height:1.5;color:var(--ink);
+    -webkit-font-smoothing:antialiased;
+    background:
+      radial-gradient(120% 80% at 12% 4%, #FBF3EC 0%, rgba(251,243,236,0) 55%),
+      radial-gradient(100% 70% at 88% 12%, var(--rose) 0%, rgba(234,198,189,0) 60%),
+      radial-gradient(130% 90% at 50% 104%, #D9B7C0 0%, rgba(217,183,192,0) 62%),
+      linear-gradient(170deg, var(--sand) 0%, var(--sky) 100%);
+    background-attachment:fixed;
+    padding:22px 18px calc(110px + env(safe-area-inset-bottom));
+    max-width:560px;margin:0 auto;
+  }
+  button,input,textarea{font-family:inherit;color:inherit}
+  :focus-visible{outline:2px solid var(--clay);outline-offset:3px}
+
+  .mark{font-family:'Prata',Georgia,serif;font-size:19px;letter-spacing:.22em;text-align:center;margin:0 0 22px}
+  .glass{
+    background:var(--glass);border:1px solid var(--edge);border-radius:26px;
+    backdrop-filter:blur(18px) saturate(140%);-webkit-backdrop-filter:blur(18px) saturate(140%);
+    box-shadow:0 14px 40px rgba(120,80,72,.10);
+  }
+
+  /* фраза дня */
+  .today{padding:24px 22px;margin-bottom:18px}
+  .today p{font-family:'Prata',Georgia,serif;font-size:21px;line-height:1.38;margin:0}
+  .today .tag{font-size:12.5px;color:var(--muted);margin:0 0 10px;letter-spacing:.04em}
+
+  /* цель */
+  .goal{padding:18px 22px;margin-bottom:18px;display:flex;gap:14px;align-items:center}
+  .goal .txt{flex:1}
+  .goal h1{font-family:'Prata',serif;font-weight:400;font-size:18px;line-height:1.3;margin:0}
+  .goal small{display:block;color:var(--muted);font-size:12.5px;margin-top:4px}
+  .count{font-family:'Prata',serif;font-size:30px;color:var(--clay);line-height:1}
+  .count em{display:block;font-style:normal;font-family:'Manrope';font-size:11px;color:var(--muted);text-align:center}
+
+  .strip{display:flex;gap:4px;margin:0 6px 26px}
+  .dot{flex:1;height:5px;border-radius:3px;background:rgba(255,255,255,.6)}
+  .dot.part{background:var(--rose)}
+  .dot.full{background:var(--clay)}
+  .dot.today{outline:1.5px solid var(--ink);outline-offset:2px}
+
+  h2.part{font-family:'Prata',serif;font-weight:400;font-size:15px;color:var(--muted);margin:0 0 10px 6px}
+  section{margin-bottom:24px}
+  .row{
+    display:flex;gap:14px;align-items:flex-start;width:100%;text-align:left;cursor:pointer;
+    padding:15px 18px;margin-bottom:9px;border-radius:22px;
+    background:rgba(255,255,255,.45);border:1px solid var(--edge);
+    backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);
+  }
+  .row.on{background:rgba(152,172,150,.28);border-color:rgba(152,172,150,.6)}
+  .tick{flex:0 0 22px;height:22px;margin-top:1px;border-radius:50%;border:1.5px solid var(--muted);position:relative}
+  .row.on .tick{background:var(--sage);border-color:var(--sage)}
+  .row.on .tick::after{content:"";position:absolute;left:7px;top:3px;width:5px;height:10px;
+    border:solid #fff;border-width:0 2px 2px 0;transform:rotate(42deg)}
+  .row h3{margin:0;font-size:15.5px;font-weight:600}
+  .row p{margin:2px 0 0;font-size:13px;color:var(--muted)}
+  textarea.note{
+    width:100%;border-radius:18px;border:1px solid var(--edge);background:rgba(255,255,255,.4);
+    padding:12px 16px;font-size:14.5px;min-height:58px;resize:vertical;margin:-3px 0 9px;
+  }
+  textarea.note::placeholder{color:var(--muted)}
+
+  .pill{
+    display:inline-block;border-radius:999px;padding:11px 20px;font-size:14px;font-weight:500;
+    background:rgba(255,255,255,.5);border:1px solid var(--edge);cursor:pointer;
+  }
+  .pill.sel{background:var(--ink);color:var(--sand);border-color:var(--ink)}
+  .pill.wide{display:block;width:100%;text-align:center;background:var(--ink);color:var(--sand);border-color:var(--ink);padding:16px}
+  .quiet{display:block;width:100%;text-align:center;background:none;border:none;color:var(--muted);
+    font-size:13.5px;padding:10px;cursor:pointer;text-decoration:underline}
+
+  /* настройка */
+  .setup h1{font-family:'Prata',serif;font-weight:400;font-size:26px;line-height:1.25;margin:0 0 8px}
+  .setup .lead{color:var(--muted);font-size:14.5px;margin:0 0 22px}
+  .field{padding:18px 20px;margin-bottom:14px}
+  .field label{display:block;font-size:13px;color:var(--muted);margin-bottom:8px}
+  .field input, .field textarea{
+    width:100%;border:none;background:none;font-size:17px;padding:0;resize:none;
+    font-family:'Prata',serif;
+  }
+  .field input::placeholder,.field textarea::placeholder{font-family:'Manrope';font-size:15px;color:rgba(138,113,108,.7)}
+  .chips{display:flex;gap:9px;margin-bottom:14px}
+  .chips.wrap{flex-wrap:wrap;gap:8px}
+  .chips.wrap .pill{padding:10px 17px;font-size:14.5px}
+  .steplbl{font-family:'Prata',serif;font-size:14px;color:var(--muted);margin:0 0 10px 6px}
+
+  /* SOS */
+  .sos-btn{
+    position:fixed;left:50%;transform:translateX(-50%);
+    bottom:calc(22px + env(safe-area-inset-bottom));
+    background:var(--ink);color:var(--sand);border:none;border-radius:999px;
+    padding:15px 30px;font-size:15px;font-weight:500;cursor:pointer;
+    box-shadow:0 10px 30px rgba(61,46,44,.28);z-index:5;
+  }
+  .sheet{
+    position:fixed;inset:0;z-index:10;display:none;flex-direction:column;
+    align-items:center;justify-content:center;text-align:center;padding:34px;
+    background:linear-gradient(170deg,#F3E4DC,#DCD4DC);
+  }
+  .sheet.open{display:flex}
+  .breath{
+    width:150px;height:150px;border-radius:50%;margin-bottom:34px;
+    background:radial-gradient(circle at 35% 30%, #fff 0%, var(--rose) 60%, var(--clay) 100%);
+    box-shadow:0 16px 50px rgba(201,143,130,.4);
+  }
+  @media (prefers-reduced-motion:no-preference){
+    .sheet.open .breath{animation:breathe 12s ease-in-out infinite}
+  }
+  @keyframes breathe{0%,100%{transform:scale(.72)}33%{transform:scale(1)}}
+  .sheet h2{font-family:'Prata',serif;font-weight:400;font-size:23px;margin:0 0 12px;max-width:16em}
+  .sheet p{font-size:15.5px;color:var(--muted);margin:0 0 28px;max-width:20em}
+  .center{text-align:center;padding:70px 0;color:var(--muted)}
+</style>
+</head>
+<body>
+<div id="app"><p class="center">Минуту…</p></div>
+
+<script>
+const tg = window.Telegram?.WebApp;
+const initData = tg?.initData || "";
+let s = null, draft = { gender: "n", track: "" };
+if (tg) { tg.ready(); tg.expand(); }
+
+const esc = t => (t || "").replace(/[<>&"]/g, c => ({ "<":"&lt;", ">":"&gt;", "&":"&amp;", '"':"&quot;" }[c]));
+
+async function api(path, body = {}) {
+  const r = await fetch(path, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ initData, ...body })
+  });
+  if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || r.status);
+  return r.json();
+}
+
+/* ---------- настройка ---------- */
+function renderSetup() {
+  document.getElementById("app").innerHTML = `
+    <p class="mark">ОПОРА</p>
+    <div class="setup">
+      <h1>${s.again ? "Новая цель" : "Одна цель за раз"}</h1>
+      <p class="lead">${s.again
+        ? "Второй заход обычно идёт легче — ты уже знаешь, как это работает."
+        : "Приложение идёт с тобой, пока цель не будет достигнута. Потом можно начать заново."}</p>
+
+      <p class="steplbl">Куда идём</p>
+      <div class="chips wrap">
+        ${s.directions.map(d =>
+          `<button class="pill d ${draft.track===d.key?"sel":""}" data-d="${d.key}">${d.label}</button>`).join("")}
+      </div>
+
+      <div class="glass field">
+        <label>Цель — одной строкой, как будто уже случилось</label>
+        <textarea id="goal" rows="2" maxlength="200" placeholder="Например: своя литейка работает"></textarea>
+      </div>
+      <div class="glass field">
+        <label>Что ты увидишь в этот день? Одна деталь</label>
+        <textarea id="vision" rows="2" maxlength="200" placeholder="Например: первая плавка, гул печи"></textarea>
+      </div>
+      <p class="steplbl">Обращение</p>
+      <div class="chips">
+        ${[["f","Ко мне — в женском"],["m","В мужском"],["n","Без разницы"]].map(([k,t]) =>
+          `<button class="pill g ${draft.gender===k?"sel":""}" data-g="${k}">${t}</button>`).join("")}
+      </div>
+      <button class="pill wide" id="go">Начать</button>
+      <p class="lead" style="margin-top:14px;text-align:center">Направление задаёт слова, которые будут приходить. Цель — твоя, своими словами.</p>
+    </div>`;
+
+  document.querySelectorAll(".d").forEach(b => b.onclick = () => {
+    draft.track = b.dataset.d;
+    document.querySelectorAll(".d").forEach(x => x.classList.toggle("sel", x === b));
+  });
+  document.querySelectorAll(".g").forEach(b => b.onclick = () => {
+    draft.gender = b.dataset.g;
+    document.querySelectorAll(".g").forEach(x => x.classList.toggle("sel", x === b));
+  });
+  document.getElementById("go").onclick = async () => {
+    const goal = document.getElementById("goal").value.trim();
+    if (!draft.track) { document.querySelector(".chips.wrap").scrollIntoView({ behavior: "smooth", block: "center" }); return; }
+    if (goal.length < 3) { document.getElementById("goal").focus(); return; }
+    try {
+      s = await api("/api/setup", {
+        track: draft.track, goal,
+        vision: document.getElementById("vision").value, gender: draft.gender });
+      render();
+      setTimeout(refresh, 9000);   // подтянуть персональные фразы, когда соберутся
+    } catch (e) { alert("Не сохранилось, попробуй ещё раз"); }
+  };
+}
+
+/* ---------- день ---------- */
+function renderDay() {
+  const done = Object.keys(s.marks).length;
+  const strip = s.history.map((d, i) =>
+    `<div class="dot ${d.count >= s.dayGoal ? "full" : (d.count ? "part" : "")}${i === s.history.length - 1 ? " today" : ""}"></div>`
+  ).join("");
+
+  const parts = ["morning","day","evening"].map(part => {
+    const rows = s.practices.filter(p => p.part === part).map(p => {
+      const on = !!s.marks[p.key];
+      const note = p.note
+        ? `<textarea class="note" data-note="${p.key}" placeholder="${esc(p.hint)}">${esc(s.notes[p.key] || "")}</textarea>` : "";
+      return `<button class="row ${on ? "on" : ""}" data-key="${p.key}">
+          <span class="tick"></span>
+          <span><h3>${esc(p.title)}</h3><p>${esc(p.hint)}</p></span></button>${note}`;
+    }).join("");
+    return `<section><h2 class="part">${esc(s.partTitles[part])}</h2>${rows}</section>`;
+  }).join("");
+
+  document.getElementById("app").innerHTML = `
+    <p class="mark">ОПОРА</p>
+
+    <div class="glass today">
+      <p class="tag">${s.low ? "сегодня без планки" : "мысль дня"}</p>
+      <p>${esc(s.phrase)}</p>
+    </div>
+
+    <div class="glass goal">
+      <div class="txt">
+        <h1>${esc(s.goal)}</h1>
+        <small>${s.low ? "хватит одного пункта, серия сохранится" : `сегодня ${done} из ${s.practices.length}`}</small>
+      </div>
+      <div class="count">${s.streak}<em>дней</em></div>
+    </div>
+
+    <div class="strip">${strip}</div>
+    ${parts}
+
+    <button class="quiet" id="hard">мне сейчас тяжело</button>
+    <button class="quiet" id="fin">цель достигнута</button>
+    <button class="sos-btn" id="sos">Минута тишины</button>
+
+    <div class="sheet" id="sheet">
+      <div class="breath"></div>
+      <h2 id="st">${esc(s.sos.steps[0].title)}</h2>
+      <p id="sx">${esc(s.sos.breath)}</p>
+      <button class="pill" id="sclose">Закрыть</button>
+    </div>`;
+  wire();
+}
+
+function wire() {
+  document.querySelectorAll(".row").forEach(b => b.onclick = async () => {
+    const on = !s.marks[b.dataset.key];
+    b.classList.toggle("on", on);
+    tg?.HapticFeedback?.impactOccurred("light");
+    try { s = await api("/api/toggle", { key: b.dataset.key }); render(); }
+    catch (e) { b.classList.toggle("on", !on); }
+  });
+
+  document.querySelectorAll("[data-note]").forEach(t => t.onblur = async () => {
+    if (t.value === (s.notes[t.dataset.note] || "")) return;
+    try { await api("/api/note", { key: t.dataset.note, text: t.value }); s.notes[t.dataset.note] = t.value; }
+    catch (e) {}
+  });
+
+  document.getElementById("hard").onclick = async () => {
+    try { s = await api("/api/event", { kind: "hard" }); render(); window.scrollTo({ top: 0, behavior: "smooth" }); }
+    catch (e) {}
+  };
+
+  document.getElementById("fin").onclick = async () => {
+    if (!confirm("Закрыть эту цель? Итоги придут в чат, потом можно поставить новую.")) return;
+    try { s = await api("/api/finish"); render(); } catch (e) {}
+  };
+
+  document.getElementById("sos").onclick = () => runSos();
+  document.getElementById("sclose").onclick = () => closeSos();
+}
+
+/* ---------- минута тишины ---------- */
+let sosTimers = [];
+function runSos() {
+  const sheet = document.getElementById("sheet");
+  sheet.classList.add("open");
+  tg?.HapticFeedback?.impactOccurred("soft");
+  api("/api/event", { kind: "sos" }).catch(() => {});
+  const steps = s.sos.steps.map((st, i) =>
+    i === s.sos.steps.length - 1 ? { ...st, text: s.sos.close } : st);
+  let t = 0;
+  steps.forEach(st => {
+    sosTimers.push(setTimeout(() => {
+      document.getElementById("st").textContent = st.title;
+      document.getElementById("sx").textContent = st.text;
+    }, t * 1000));
+    t += st.seconds || 25;
+  });
+}
+function closeSos() {
+  sosTimers.forEach(clearTimeout); sosTimers = [];
+  document.getElementById("sheet").classList.remove("open");
+  refresh();
+}
+
+function render() { s.setup ? renderSetup() : renderDay(); }
+async function refresh() { try { s = await api("/api/state"); render(); } catch (e) {} }
+
+(async () => {
+  if (!initData) {
+    document.getElementById("app").innerHTML = '<p class="center">Открой через кнопку «Опора» в боте.</p>';
+    return;
+  }
+  try { s = await api("/api/state"); render(); }
+  catch (e) { document.getElementById("app").innerHTML = `<p class="center">Не загрузилось: ${esc(String(e.message))}</p>`; }
+})();
+</script>
+</body>
+</html>
