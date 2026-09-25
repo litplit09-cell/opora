@@ -59,7 +59,7 @@
   .dot{flex:1;height:5px;border-radius:3px;background:rgba(255,255,255,.6)}
   .dot.part{background:var(--rose)}
   .dot.full{background:var(--clay)}
-  .dot.today{outline:1.5px solid var(--ink);outline-offset:2px}
+  .dot.now{outline:1.5px solid var(--ink);outline-offset:2px}
 
   h2.part{font-family:'Prata',serif;font-weight:400;font-size:15px;color:var(--muted);margin:0 0 10px 6px}
   section{margin-bottom:24px}
@@ -90,7 +90,7 @@
   .pill.wide{display:block;width:100%;text-align:center;background:var(--ink);color:var(--sand);border-color:var(--ink);padding:16px}
   .quiet{display:inline-block;background:none;border:none;color:var(--muted);
     font-size:13.5px;padding:8px 6px;cursor:pointer;text-decoration:underline;text-underline-offset:3px}
-  .foot{display:flex;justify-content:center;flex-wrap:wrap;gap:4px 18px;margin-top:10px}
+  .foot{display:flex;justify-content:center;flex-wrap:wrap;gap:2px 12px;margin-top:10px}
   .today .quiet{padding:10px 0 0;font-size:13px}
 
   /* настройка */
@@ -127,6 +127,25 @@
   .sheet h2{font-family:'Prata',serif;font-weight:400;font-size:23px;margin:0 0 12px;max-width:16em}
   .sheet p{font-size:15.5px;color:var(--muted);margin:0 0 28px;max-width:20em}
   .center{text-align:center;padding:70px 0;color:var(--muted)}
+
+  /* бонус дня и слово дня */
+  .bonus{padding:20px 22px;margin-bottom:18px}
+  .bonus .head{display:flex;gap:12px;align-items:flex-start;cursor:pointer}
+  .bonus .head h3{margin:0;font-size:15.5px;font-weight:600}
+  .bonus .head p{margin:2px 0 0;font-size:13px;color:var(--muted)}
+  .bonus .body{display:none;margin-top:14px}
+  .bonus.open .body{display:block}
+  .bonus .why{font-size:14px;margin:0 0 10px}
+  .bonus ol{margin:0 0 12px;padding-left:20px;font-size:14px}
+  .bonus li{margin-bottom:6px}
+  .bonus .src{font-size:12px;color:var(--muted);margin:0 0 14px}
+  .bonus .tick{cursor:pointer}
+  .bonus.done .tick{background:var(--sage);border-color:var(--sage)}
+  .bonus.done .tick::after{content:"";position:absolute;left:7px;top:3px;width:5px;height:10px;
+    border:solid #fff;border-width:0 2px 2px 0;transform:rotate(42deg)}
+  .word{padding:20px 22px;margin-bottom:18px}
+  .word p{font-family:'Prata',Georgia,serif;font-size:16.5px;line-height:1.45;margin:0}
+  .word small{display:block;color:var(--muted);font-size:12.5px;margin-top:8px}
 </style>
 </head>
 <body>
@@ -232,7 +251,7 @@ function goalsRow() {
 function renderDay() {
   const done = Object.keys(s.marks).length;
   const strip = s.history.map((d, i) =>
-    `<div class="dot ${d.count >= s.dayGoal ? "full" : (d.count ? "part" : "")}${i === s.history.length - 1 ? " today" : ""}"></div>`
+    `<div class="dot ${d.count >= s.dayGoal ? "full" : (d.count ? "part" : "")}${i === s.history.length - 1 ? " now" : ""}"></div>`
   ).join("");
 
   const parts = ["morning","day","evening"].map(part => {
@@ -269,6 +288,25 @@ function renderDay() {
 
     <div class="strip">${strip}</div>
     ${parts}
+
+    <section>
+      <h2 class="part">Бонус, если захочется</h2>
+      <div class="glass bonus ${s.bonusDone ? "done" : ""}" id="bonus">
+        <div class="head" id="bonus-head">
+          <span class="tick" id="bonus-tick"></span>
+          <span><h3>${esc(s.bonus.title)}</h3><p>${s.bonus.minutes} мин · необязательно · ${esc(s.bonus.why)}</p></span>
+        </div>
+        <div class="body">
+          <ol>${s.bonus.steps.map(x => `<li>${esc(x)}</li>`).join("")}</ol>
+          <p class="src">${esc(s.bonus.source)}</p>
+        </div>
+      </div>
+    </section>
+
+    <div class="glass word">
+      <p>${esc(s.quote.text)}</p>
+      <small>${s.quote.kind === "idea" ? "по мотивам — " : "— "}${esc(s.quote.author)}${s.quote.source ? ", " + esc(s.quote.source) : ""}</small>
+    </div>
 
     <div class="foot">
       <button class="quiet" id="hard">сегодня не идёт</button>
@@ -318,6 +356,16 @@ function wire() {
   });
   const add = document.getElementById("add");
   if (add) add.onclick = () => { adding = true; draft.track = ""; render(); window.scrollTo(0, 0); };
+
+  // бонус: тап по заголовку раскрывает шаги, тап по кружку отмечает сделанным
+  const bonus = document.getElementById("bonus");
+  document.getElementById("bonus-head").onclick = () => bonus.classList.toggle("open");
+  document.getElementById("bonus-tick").onclick = async ev => {
+    ev.stopPropagation();
+    bonus.classList.toggle("done");
+    tg?.HapticFeedback?.impactOccurred("light");
+    try { s = await api("/api/toggle", { key: "bonus" }); render(); } catch (e) { bonus.classList.toggle("done"); }
+  };
 
   document.querySelectorAll(".sos-open").forEach(b => b.onclick = () => runSos());
   document.getElementById("sclose").onclick = () => closeSos();

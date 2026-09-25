@@ -454,6 +454,7 @@ def state_payload(uid: int) -> dict:
     goal_n = MIN_GOAL if low else DAY_GOAL
     e = day_entries(uid, today())
     pack = get_pack(u)
+    bonus = pick(C.BONUS, uid, "bonus")  # необязательная практика дня, в планку не входит
     practices = []
     for p in C.PRACTICES:
         item = dict(p)
@@ -480,6 +481,9 @@ def state_payload(uid: int) -> dict:
         "totalMarks": total_marks(uid),
         "history": history(uid),
         "personal": bool(u["pack"]),
+        "bonus": bonus,
+        "bonusDone": e.get(f"bonus:{bonus['id']}") == "1",
+        "quote": pick(C.QUOTES, uid, "quote"),
         "sos": {
             "breath": C.BREATH,
             "steps": C.SOS_STEPS,
@@ -549,9 +553,12 @@ async def api_toggle(request):
     if err is not None:
         return err
     uid, body = res
-    if body.get("key") not in PRACTICE_KEYS:
+    key = body.get("key")
+    if key == "bonus":  # бонус хранится под своим id — потом видно, какие практики заходят
+        key = f"bonus:{pick(C.BONUS, uid, 'bonus')['id']}"
+    elif key not in PRACTICE_KEYS:
         return web.json_response({"error": "unknown_key"}, status=400)
-    toggle_mark(uid, today(), body["key"])
+    toggle_mark(uid, today(), key)
     return web.json_response(state_payload(uid))
 
 
