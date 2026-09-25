@@ -155,6 +155,17 @@
   .bonus.done .tick{background:var(--sage);border-color:var(--sage)}
   .bonus.done .tick::after{content:"";position:absolute;left:7px;top:3px;width:5px;height:10px;
     border:solid #fff;border-width:0 2px 2px 0;transform:rotate(42deg)}
+  /* пять минут ни о чём: два тихих занятия без счёта и без цели */
+  .play{padding:18px 22px;margin-bottom:18px}
+  .play p{margin:0 0 10px;font-size:13px;color:var(--muted)}
+  .play .chips{margin:0}
+  .sheet.game{padding:0}
+  .sheet.game canvas{position:absolute;inset:0;width:100%;height:100%;touch-action:none;cursor:crosshair}
+  .sheet.game .hint{position:absolute;top:30px;left:0;right:0;text-align:center;color:var(--muted);
+    font-size:14px;margin:0;max-width:none;pointer-events:none}
+  .sheet.game .pill{position:absolute;left:50%;transform:translateX(-50%);
+    bottom:calc(26px + env(safe-area-inset-bottom))}
+
   .word{padding:20px 22px;margin-bottom:18px}
   .word p{font-family:'Prata',Georgia,serif;font-size:16.5px;line-height:1.45;margin:0}
   .word small{display:block;color:var(--muted);font-size:12.5px;margin-top:8px}
@@ -315,6 +326,20 @@ function renderDay() {
       </div>
     </section>
 
+    <div class="glass play">
+      <p>Пять минут ни о чём — без счёта и без цели</p>
+      <div class="chips">
+        <button class="pill game-open" data-game="water">Круги на воде</button>
+        <button class="pill game-open" data-game="sand">Песок</button>
+      </div>
+    </div>
+
+    <div class="sheet game" id="game">
+      <canvas id="cv"></canvas>
+      <p class="hint" id="ghint"></p>
+      <button class="pill" id="gclose">Закрыть</button>
+    </div>
+
     <div class="glass word">
       <p>${esc(s.quote.text)}</p>
       <small>${s.quote.kind === "idea" ? "по мотивам — " : "— "}${esc(s.quote.author)}${s.quote.source ? ", " + esc(s.quote.source) : ""}</small>
@@ -392,6 +417,71 @@ function wire() {
 
   document.getElementById("retro-open").onclick = openRetro;
   document.getElementById("rclose").onclick = () => document.getElementById("retro").classList.remove("open");
+
+  document.querySelectorAll(".game-open").forEach(b => b.onclick = () => openGame(b.dataset.game));
+  document.getElementById("gclose").onclick = closeGame;
+}
+
+/* ---------- пять минут ни о чём ---------- */
+// Вода: тап — круги расходятся и тают. Песок: палец оставляет след, который медленно
+// исчезает. Ни очков, ни таймера, ни «уровней» — только движение и тишина.
+const game = { raf: 0, kind: "", items: [], ctx: null, w: 0, h: 0 };
+const GAME_HINT = { water: "Коснись воды", sand: "Веди пальцем по песку" };
+
+function openGame(kind) {
+  const sheet = document.getElementById("game"), cv = document.getElementById("cv");
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  game.w = window.innerWidth; game.h = window.innerHeight; game.kind = kind; game.items = [];
+  cv.width = game.w * dpr; cv.height = game.h * dpr;
+  game.ctx = cv.getContext("2d"); game.ctx.scale(dpr, dpr);
+  document.getElementById("ghint").textContent = GAME_HINT[kind];
+  sheet.classList.add("open");
+  tg?.HapticFeedback?.impactOccurred("soft");
+  cv.onpointerdown = ev => { cv.setPointerCapture(ev.pointerId); touch(ev, true); };
+  cv.onpointermove = ev => { if (ev.buttons) touch(ev, false); };
+  cancelAnimationFrame(game.raf);
+  game.raf = requestAnimationFrame(drawGame);
+}
+function touch(ev, down) {
+  const x = ev.clientX, y = ev.clientY, now = performance.now();
+  if (game.kind === "water") {
+    if (!down) return;
+    for (let i = 0; i < 3; i++) game.items.push({ x, y, t: now + i * 260 });  // три круга с задержкой
+    document.getElementById("ghint").textContent = "";
+  } else {
+    const last = game.items[game.items.length - 1];
+    if (last && Math.hypot(last.x - x, last.y - y) < 6) return;
+    game.items.push({ x, y, t: now });
+    if (game.items.length > 1500) game.items.shift();
+    document.getElementById("ghint").textContent = "";
+  }
+}
+function drawGame() {
+  const c = game.ctx, now = performance.now();
+  if (!c) return;
+  c.clearRect(0, 0, game.w, game.h);
+  if (game.kind === "water") {
+    const maxR = Math.min(game.w, game.h) * 0.45;
+    game.items = game.items.filter(r => now - r.t < 3200);
+    for (const r of game.items) {
+      const age = now - r.t; if (age < 0) continue;
+      const k = age / 3200, rad = 6 + k * maxR;
+      c.beginPath(); c.arc(r.x, r.y, rad, 0, Math.PI * 2);
+      c.strokeStyle = `rgba(201,143,130,${(1 - k) * 0.55})`; c.lineWidth = 2.5 - k * 1.8; c.stroke();
+    }
+  } else {
+    game.items = game.items.filter(g => now - g.t < 14000);
+    for (const g of game.items) {
+      const k = (now - g.t) / 14000;
+      c.beginPath(); c.arc(g.x, g.y, 13, 0, Math.PI * 2);
+      c.fillStyle = `rgba(201,143,130,${(1 - k) * 0.16})`; c.fill();
+    }
+  }
+  game.raf = requestAnimationFrame(drawGame);
+}
+function closeGame() {
+  cancelAnimationFrame(game.raf); game.raf = 0; game.items = [];
+  document.getElementById("game").classList.remove("open");
 }
 
 /* ---------- оглянуться ---------- */
