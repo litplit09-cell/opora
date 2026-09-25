@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import hmac
+import html
 import json
 import logging
 import os
@@ -231,6 +232,63 @@ def finish_goal(uid: int, gid: int):
                 conn.execute("UPDATE goals SET is_main=1 WHERE id=?", (nxt["id"],))
         mirror_main(conn, uid)
     return {"goal": g["goal"], "days": days, "marks": marks, "hard": hard}
+
+
+# ---------- взгляд назад ----------
+# Возвращаем человеку его собственные слова. Не статистика и не оценка —
+# три-четыре заметки, которые он сам оставил, с датами. Без ИИ: только цитаты.
+
+WEEKDAYS = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"]
+MONTHS = ["янв", "фев", "мар", "апр", "мая", "июн", "июл", "авг", "сен", "окт", "ноя", "дек"]
+NOTE_TITLES = {p["key"]: p["title"] for p in C.PRACTICES if p.get("note")}
+
+
+def day_label(day: str) -> str:
+    d = datetime.fromisoformat(day).date()
+    return f"{WEEKDAYS[d.weekday()]}, {d.day} {MONTHS[d.month - 1]}"
+
+
+def past_days(uid: int, days: int) -> list:
+    """Дни за период, где было хоть что-то: отметки или заметки. Свежие сверху."""
+    d0 = datetime.now(TZ).date()
+    since = (d0 - timedelta(days=days - 1)).isoformat()
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT day, key, value FROM entries WHERE user_id=? AND day>=? AND day<=? ORDER BY day DESC",
+            (uid, since, d0.isoformat()),
+        ).fetchall()
+    out = {}
+    for r in rows:
+        d = out.setdefault(r["day"], {"day": r["day"], "label": day_label(r["day"]), "marks": 0, "notes": []})
+        if r["key"] in PRACTICE_KEYS and r["value"] == "1":
+            d["marks"] += 1
+        elif r["key"].startswith("note:") and r["value"].strip():
+            d["notes"].append({"title": NOTE_TITLES.get(r["key"][5:], ""), "text": r["value"].strip()})
+    return list(out.values())
+
+
+def retro_text(uid: int) -> str | None:
+    """Воскресное сообщение: неделя словами самого человека. None — если заметок не было."""
+    week = past_days(uid, 7)
+    notes = [(d, n) for d in reversed(week) for n in d["notes"]]  # от старых к новым
+    if not notes:
+        return None
+    active = sum(1 for d in week if d["marks"])
+    marks = sum(d["marks"] for d in week)
+    line = lambda d, n: f"<b>{d['label']}</b>, {n['title'].lower()}: «{html.escape(n['text'][:160])}»"
+    picked, seen = [], set()
+    for d, n in notes:  # по одной заметке каждого вида, самые ранние — начало недели
+        if n["title"] not in seen:
+            seen.add(n["title"])
+            picked.append(line(d, n))
+    tail = line(*notes[-1])  # и самая свежая, чем бы она ни была
+    if tail not in picked:
+        picked.append(tail)
+    return (
+        f"Оглянись на неделю.\n\nДней с отметками: {active} из 7, {plural_marks(marks)}.\n\n"
+        + "\n\n".join(picked[:4])
+        + "\n\nЭто твои слова, не мои. Они и есть движение."
+    )
 
 
 def days_since(day: str) -> int:
@@ -543,6 +601,14 @@ async def api_setup(request):
     return web.json_response(state_payload(uid))
 
 
+async def api_retro(request):
+    """Экран «оглянуться»: две недели заметок и отметок, свежие сверху."""
+    res, err = await auth(request)
+    if err is not None:
+        return err
+    return web.json_response({"days": past_days(res[0], 14)})
+
+
 async def api_main(request):
     """Сделать цель главной — её слова станут фразами дня."""
     res, err = await auth(request)
@@ -617,7 +683,7 @@ def make_app():
     for path, handler in (
         ("/api/state", api_state), ("/api/setup", api_setup), ("/api/toggle", api_toggle),
         ("/api/note", api_note), ("/api/event", api_event), ("/api/finish", api_finish),
-        ("/api/main", api_main),
+        ("/api/main", api_main), ("/api/retro", api_retro),
     ):
         app.router.add_post(path, handler)
     return app
@@ -673,6 +739,17 @@ async def cmd_stats(m: Message):
         f"<code>{bar}</code>",
         reply_markup=kb(),
     )
+
+
+@dp.message(Command("nedelya"))
+async def cmd_week(m: Message):
+    """Взгляд назад по запросу, не дожидаясь воскресенья."""
+    uid = m.from_user.id
+    if not allowed(uid):
+        return
+    ensure_user(uid, m.from_user.first_name or "")
+    await m.answer(retro_text(uid) or "За неделю заметок не было. Они появляются, когда что-то "
+                   "записано в «один шаг», «три вещи» или «завтрашний день».", reply_markup=kb())
 
 
 @dp.message(Command("lyudi"))
@@ -783,6 +860,8 @@ async def reminders():
                 pack = get_pack(u)
                 if slot == "morning":
                     text = phrase_of_day(uid, u, True) if low else pick(pack["morning"], uid, "morn")
+                elif now.weekday() == 6 and (retro := retro_text(uid)):
+                    text = retro  # воскресенье: вместо вечерней фразы — неделя его словами
                 else:
                     if marks_count(uid, day) >= (MIN_GOAL if low else DAY_GOAL):
                         continue  # день уже закрыт — не дёргать

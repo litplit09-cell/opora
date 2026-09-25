@@ -126,6 +126,18 @@
   @keyframes breathe{0%,100%{transform:scale(.72)}33%{transform:scale(1)}}
   .sheet h2{font-family:'Prata',serif;font-weight:400;font-size:23px;margin:0 0 12px;max-width:16em}
   .sheet p{font-size:15.5px;color:var(--muted);margin:0 0 28px;max-width:20em}
+
+  /* оглянуться: две недели заметок, свежие сверху */
+  .sheet.retro{justify-content:flex-start;align-items:stretch;text-align:left;overflow:auto;
+    padding:32px 22px calc(32px + env(safe-area-inset-bottom))}
+  .sheet.retro h2{margin-bottom:4px}
+  .sheet.retro .lead{margin:0 0 22px;max-width:none}
+  .rday{margin-bottom:20px}
+  .rday b{display:block;font-weight:500;font-size:13px;color:var(--muted);margin-bottom:6px;letter-spacing:.03em}
+  .rday p{margin:0 0 8px;font-size:15.5px;color:var(--ink);max-width:none;line-height:1.4}
+  .rday p small{display:block;font-size:12px;color:var(--muted)}
+  .rday .none{color:var(--muted);font-size:14px}
+  .sheet.retro .pill{align-self:center;margin-top:8px}
   .center{text-align:center;padding:70px 0;color:var(--muted)}
 
   /* бонус дня и слово дня */
@@ -311,7 +323,15 @@ function renderDay() {
     <div class="foot">
       <button class="quiet" id="hard">сегодня не идёт</button>
       <button class="quiet sos-open">нужна опора</button>
+      <button class="quiet" id="retro-open">оглянуться</button>
       <button class="quiet" id="fin">цель достигнута</button>
+    </div>
+
+    <div class="sheet retro" id="retro">
+      <h2>Две недели</h2>
+      <p class="lead">Твои слова, как они были записаны. Свежие сверху.</p>
+      <div id="rbody"><p class="center">Минуту…</p></div>
+      <button class="pill" id="rclose">Закрыть</button>
     </div>
 
     <div class="sheet" id="sheet">
@@ -369,6 +389,26 @@ function wire() {
 
   document.querySelectorAll(".sos-open").forEach(b => b.onclick = () => runSos());
   document.getElementById("sclose").onclick = () => closeSos();
+
+  document.getElementById("retro-open").onclick = openRetro;
+  document.getElementById("rclose").onclick = () => document.getElementById("retro").classList.remove("open");
+}
+
+/* ---------- оглянуться ---------- */
+async function openRetro() {
+  const sheet = document.getElementById("retro"), body = document.getElementById("rbody");
+  sheet.classList.add("open"); sheet.scrollTop = 0;
+  try {
+    const r = await api("/api/retro");
+    body.innerHTML = r.days.length ? r.days.map(d => `
+      <div class="rday">
+        <b>${esc(d.label)} · ${d.marks ? d.marks + " из " + s.practices.length : "без отметок"}</b>
+        ${d.notes.length
+          ? d.notes.map(n => `<p>${esc(n.text)}<small>${esc(n.title.toLowerCase())}</small></p>`).join("")
+          : `<p class="none">заметок не было</p>`}
+      </div>`).join("")
+      : `<p class="lead">Пока пусто. Заметки появятся, когда что-то будет записано в «один шаг», «три вещи» или «завтрашний день».</p>`;
+  } catch (e) { body.innerHTML = `<p class="lead">Не загрузилось. Попробуй ещё раз.</p>`; }
 }
 
 /* ---------- минута тишины ---------- */
