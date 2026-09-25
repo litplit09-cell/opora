@@ -111,7 +111,10 @@ def init_db():
                     "VALUES (?,?,?,?,?,?,1)",
                     (u["user_id"], u["track"], u["goal"], u["vision"], u["pack"], u["started_at"]),
                 )
-    log.info("db ready at %s", DB_PATH)
+        n_users = conn.execute("SELECT COUNT(*) c FROM users").fetchone()["c"]
+        n_goals = conn.execute("SELECT COUNT(*) c FROM goals WHERE finished_at=''").fetchone()["c"]
+    # если после деплоя здесь нули — база не на томе и стёрлась; см. CLAUDE.md про /data
+    log.info("db ready at %s: users %s, active goals %s", DB_PATH, n_users, n_goals)
 
 
 def today() -> str:
@@ -437,7 +440,10 @@ INDEX = Path(__file__).parent / "index.html"
 
 
 async def page(request):
-    return web.FileResponse(INDEX)
+    # Telegram цепко кэширует мини-апп: после деплоя люди днями видят старую страницу
+    return web.FileResponse(INDEX, headers={
+        "Cache-Control": "no-cache, no-store, must-revalidate", "Pragma": "no-cache", "Expires": "0",
+    })
 
 
 async def health(request):
