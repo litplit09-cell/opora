@@ -12,7 +12,7 @@ import logging
 import os
 import re
 
-import aiohttp
+import anthropic
 
 import content as C
 
@@ -20,7 +20,7 @@ log = logging.getLogger("opora.gen")
 
 API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 MODEL = os.environ.get("CLAUDE_MODEL", "claude-opus-5")
-URL = "https://api.anthropic.com/v1/messages"
+client = anthropic.AsyncAnthropic() if API_KEY else None
 
 # цена за миллион токенов, доллары — чтобы /lyudi показывала расход
 PRICES = {
@@ -39,6 +39,7 @@ PROMPT = """Ты пишешь короткие тексты для прилож�
 
 Цель человека, его словами: {goal}
 Как он описал момент, когда цель достигнута: {vision}
+Зачем ему это, его словами: {values}
 Грамматический род, в котором к нему обращаться: {gender}
 
 Правила:
@@ -83,46 +84,29 @@ def _validate(data: dict) -> dict:
     return out
 
 
-async def build_pack(goal: str, vision: str, gender: str) -> tuple[dict, dict]:
+async def build_pack(goal: str, vision: str, gender: str, values: str = "") -> tuple[dict, dict]:
     """Возвращает (персональный пак, usage). При любой ошибке — запасной пак и пустой usage.
     usage: {"model", "tokens_in", "tokens_out"} — бот пишет это в базу для учёта расходов."""
-    if not API_KEY:
+    if not client:
         log.info("нет ANTHROPIC_API_KEY, работаем на запасном паке")
         return dict(C.FALLBACK_PACK), {}
-
-    body = {
-        "model": MODEL,
-        "max_tokens": 12000,   # модель думает перед ответом, это тоже входит в лимит
-        "messages": [{
-            "role": "user",
-            "content": PROMPT.format(
+    try:
+        resp = await client.with_options(timeout=180.0).messages.create(
+            model=MODEL,
+            max_tokens=12000,   # модель думает перед ответом, это тоже входит в лимит
+            messages=[{"role": "user", "content": PROMPT.format(
                 goal=goal or "не указана",
                 vision=vision or "не описан",
+                values=values or "не сказано",
                 gender=C.GENDER_LABEL.get(gender, "не указан"),
-            ),
-        }],
-    }
-    headers = {
-        "x-api-key": API_KEY,
-        "anthropic-version": "2023-06-01",
-        "content-type": "application/json",
-    }
-    try:
-        timeout = aiohttp.ClientTimeout(total=180)
-        async with aiohttp.ClientSession(timeout=timeout) as s:
-            async with s.post(URL, json=body, headers=headers) as r:
-                if r.status != 200:
-                    log.warning("api %s: %s", r.status, (await r.text())[:200])
-                    return dict(C.FALLBACK_PACK), {}
-                data = await r.json()
-        u = data.get("usage", {})
-        usage = {"model": data.get("model", MODEL),
-                 "tokens_in": int(u.get("input_tokens", 0)),
-                 "tokens_out": int(u.get("output_tokens", 0))}
-        if data.get("stop_reason") == "refusal":
-            log.warning("модель отказалась отвечать: %s", data.get("stop_details"))
+            )}],
+        )
+        usage = {"model": resp.model, "tokens_in": resp.usage.input_tokens,
+                 "tokens_out": resp.usage.output_tokens}
+        if resp.stop_reason == "refusal":
+            log.warning("модель отказалась отвечать: %s", resp.stop_details)
             return dict(C.FALLBACK_PACK), usage
-        text = "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text")
+        text = "".join(b.text for b in resp.content if b.type == "text")
         pack = _validate(json.loads(_clean(text)))
         log.info("пак собран: %s дневных фраз, %s/%s токенов",
                  len(pack["daily"]), usage["tokens_in"], usage["tokens_out"])

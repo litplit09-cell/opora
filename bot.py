@@ -13,11 +13,12 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from aiohttp import web
-from aiogram import Bot, Dispatcher
+from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
 from aiogram.types import (
+    BotCommand,
     Message,
     MenuButtonWebApp,
     WebAppInfo,
@@ -25,6 +26,7 @@ from aiogram.types import (
     InlineKeyboardMarkup,
 )
 
+import agent
 import content as C
 from generator import build_pack, cost_usd
 from packs import match_pack, pack_by_key, DIRECTIONS
@@ -96,12 +98,20 @@ def init_db():
                 pack        TEXT DEFAULT '', started_at TEXT, is_main INTEGER DEFAULT 0,
                 finished_at TEXT DEFAULT ''
             );
+            CREATE TABLE IF NOT EXISTS chat (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER, day TEXT, ts TEXT, role TEXT, content TEXT
+            );
             """
         )
         have = {r[1] for r in conn.execute("PRAGMA table_info(users)")}
         for col, decl in (("gender", "TEXT DEFAULT 'n'"), ("pack", "TEXT DEFAULT ''"),
                           ("track", "TEXT DEFAULT ''"),
-                          ("vision", "TEXT DEFAULT ''"), ("runs", "INTEGER DEFAULT 0")):
+                          ("vision", "TEXT DEFAULT ''"), ("runs", "INTEGER DEFAULT 0"),
+                          ("why", "TEXT DEFAULT ''"),         # зачем ему цель, его словами
+                          ("profile", "TEXT DEFAULT ''"),     # недельный профиль поведения, JSON
+                          ("quiet_morning", "INTEGER DEFAULT 0"),  # утренние не откликаются — молчим
+                          ("announced", "TEXT DEFAULT ''")):  # какую версию новостей уже получил
             if col not in have:
                 conn.execute(f"ALTER TABLE users ADD COLUMN {col} {decl}")
         # у кого цель лежала только в users (старая схема) — переносим в goals как главную
@@ -295,6 +305,202 @@ def days_since(day: str) -> int:
     if not day:
         return 1
     return (datetime.now(TZ).date() - datetime.fromisoformat(day).date()).days + 1
+
+
+# ---------- разговор с ботом ----------
+# Любой текст в чат — это разговор с ИИ (agent.py). История лежит в chat,
+# в формате API как есть; обрезается по границе реплики человека, чтобы не
+# разорвать пару tool_use/tool_result.
+
+CHAT_KEEP = 40          # сообщений истории в контексте
+CHAT_DAILY_LIMIT = 40   # реплик человека в день — потолок расходов на одного
+
+
+def chat_history(uid: int) -> list:
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT role, content FROM chat WHERE user_id=? ORDER BY id DESC LIMIT ?", (uid, CHAT_KEEP)
+        ).fetchall()
+    msgs = [{"role": r["role"], "content": json.loads(r["content"])} for r in reversed(rows)]
+    while msgs and not (msgs[0]["role"] == "user" and isinstance(msgs[0]["content"], str)):
+        msgs.pop(0)  # история должна начинаться с живой реплики человека
+    return msgs
+
+
+def chat_append(uid: int, msgs: list):
+    ts = datetime.now(TZ).isoformat(timespec="seconds")
+    with db() as conn:
+        conn.executemany(
+            "INSERT INTO chat (user_id, day, ts, role, content) VALUES (?,?,?,?,?)",
+            [(uid, today(), ts, m["role"], json.dumps(m["content"], ensure_ascii=False)) for m in msgs],
+        )
+
+
+def chat_count_today(uid: int) -> int:
+    with db() as conn:
+        return conn.execute(
+            "SELECT COUNT(*) c FROM chat WHERE user_id=? AND day=? AND role='user'", (uid, today())
+        ).fetchone()["c"]
+
+
+def chat_context(uid: int) -> str:
+    """Что известно о человеке прямо сейчас — для одного хода разговора."""
+    u = user_row(uid)
+    goals = user_goals(uid)
+    low = in_low(uid) if goals else False
+    lines = [f"Имя: {u['name'] or 'не указано'}. Род обращения: {C.GENDER_LABEL.get(u['gender'], 'не указан')}."]
+    if goals:
+        lines.append("Цели: " + "; ".join(
+            f"«{g['goal']}»{' (главная)' if g['is_main'] else ''}, {days_since(g['started_at'])}-й день"
+            for g in goals))
+        lines.append(f"Сегодня отметок: {marks_count(uid, today())}, серия: "
+                     f"{streak(uid, MIN_GOAL if low else DAY_GOAL)} дн., всего: {total_marks(uid)}.")
+        if low:
+            lines.append("Сейчас человек на спаде: сам сказал, что не идёт, или пустые дни после серии.")
+    else:
+        lines.append("Целей пока нет — помоги сформулировать, если человек к этому готов.")
+    if u["why"]:
+        lines.append(f"Зачем ему цель, его словами: «{u['why']}».")
+    notes = [(d, n) for d in past_days(uid, 7) for n in d["notes"]][:6]
+    if notes:
+        lines.append("Заметки за неделю: " + " | ".join(
+            f"{d['label']}, {n['title'].lower()}: «{n['text'][:120]}»" for d, n in notes))
+    if u["profile"]:
+        try:
+            p = json.loads(u["profile"])
+            lines.append(f"Профиль поведения: {p.get('summary', '')} Как говорить: {p.get('tone', '')}")
+        except json.JSONDecodeError:
+            pass
+    lines.append(f"Сейчас {datetime.now(TZ).strftime('%H:%M')}, {day_label(today())}.")
+    return "\n".join(lines)
+
+
+async def chat_reply(uid: int, text: str) -> tuple[str, bool]:
+    """Ответ на реплику в чате. Возвращает (текст, появились ли новые цели)."""
+    if chat_count_today(uid) >= CHAT_DAILY_LIMIT:
+        return C.CHAT_LIMIT, False
+    created = {"goals": False}
+
+    async def execute(name: str, inp: dict) -> str:
+        if name == "save_goals":
+            u = user_row(uid)
+            saved = []
+            for g in inp["goals"]:
+                gid = add_goal(uid, g["track"], g["goal"], g["vision"], None)
+                if gid is None:
+                    break
+                saved.append(g["goal"])
+                asyncio.create_task(make_pack_for(uid, gid))
+            created["goals"] = bool(saved)
+            if not saved:
+                return f"Не сохранено: уже {MAX_GOALS} цели, больше нельзя."
+            return "Сохранено: " + "; ".join(saved) + ". Скажи человеку открыть приложение."
+        if name == "save_values":
+            with db() as conn:
+                conn.execute("UPDATE users SET why=? WHERE user_id=?", (inp["text"][:300], uid))
+            return "Записано."
+        return "Неизвестный инструмент."
+
+    text_out, new_msgs, usage = await agent.reply(chat_history(uid), text[:2000], chat_context(uid), execute)
+    chat_append(uid, new_msgs)
+    save_usage(uid, "chat", usage)
+    return text_out, created["goals"]
+
+
+# ---------- анализ поведения ----------
+# Раз в неделю: сухая статистика → короткий профиль (agent.build_profile).
+# Плюс одно правило без ИИ: если две недели утренние уведомления не открывают,
+# а вечерние открывают — утренние замолкают.
+
+def behavior_stats(uid: int, days: int = 14) -> dict:
+    d0 = datetime.now(TZ).date()
+    since = (d0 - timedelta(days=days)).isoformat()
+    with db() as conn:
+        ev = conn.execute(
+            "SELECT day, kind, ts FROM events WHERE user_id=? AND day>=? ORDER BY ts", (uid, since)
+        ).fetchall()
+        bonus = conn.execute(
+            "SELECT key FROM entries WHERE user_id=? AND day>=? AND key LIKE 'bonus:%' AND value='1'",
+            (uid, since),
+        ).fetchall()
+        chats = conn.execute(
+            "SELECT COUNT(*) c FROM chat WHERE user_id=? AND day>=? AND role='user'", (uid, since)
+        ).fetchone()["c"]
+    opens = [datetime.fromisoformat(e["ts"]) for e in ev if e["kind"] == "open"]
+    pushes = {"morning": [], "evening": []}
+    for e in ev:
+        if e["kind"].startswith("push:"):
+            pushes[e["kind"][5:]].append(datetime.fromisoformat(e["ts"]))
+    responded = {s: sum(1 for p in ts if any(0 <= (o - p).total_seconds() <= 3 * 3600 for o in opens))
+                 for s, ts in pushes.items()}
+    by_hour = {}
+    for o in opens:
+        b = f"{o.hour // 4 * 4:02d}-{o.hour // 4 * 4 + 4:02d}"
+        by_hour[b] = by_hour.get(b, 0) + 1
+    by_weekday = {}
+    for i in range(days):
+        d = d0 - timedelta(days=i)
+        by_weekday[WEEKDAYS[d.weekday()]] = by_weekday.get(WEEKDAYS[d.weekday()], 0) + marks_count(uid, d.isoformat())
+    week = past_days(uid, days)
+    return {
+        "дней_наблюдения": days,
+        "заходов": len(opens),
+        "заходы_по_часам": by_hour,
+        "утренних_уведомлений": len(pushes["morning"]), "откликов_на_утренние": responded["morning"],
+        "вечерних_уведомлений": len(pushes["evening"]), "откликов_на_вечерние": responded["evening"],
+        "отметок_по_дням_недели": by_weekday,
+        "дней_с_отметками": sum(1 for d in week if d["marks"]),
+        "заметок": sum(len(d["notes"]) for d in week),
+        "примеры_заметок": [n["text"][:100] for d in week for n in d["notes"]][:5],
+        "бонусов_сделано": len(bonus),
+        "дней_спада": sum(1 for e in ev if e["kind"] in ("hard", "sos")),
+        "реплик_в_чате": chats,
+    }
+
+
+async def weekly_profile(uid: int):
+    stats = behavior_stats(uid)
+    with db() as conn:
+        # утро молчит, если десять и больше утренних без единого отклика, а вечер откликается
+        quiet = int(stats["утренних_уведомлений"] >= 10 and stats["откликов_на_утренние"] == 0
+                    and stats["откликов_на_вечерние"] > 0)
+        conn.execute("UPDATE users SET quiet_morning=? WHERE user_id=?", (quiet, uid))
+    if not agent.enabled() or stats["заходов"] < 3:
+        return
+    profile, usage = await agent.build_profile(stats)
+    save_usage(uid, "profile", usage)
+    if profile:
+        with db() as conn:
+            conn.execute("UPDATE users SET profile=? WHERE user_id=?",
+                         (json.dumps(profile, ensure_ascii=False), uid))
+        log.info("profile for %s: %s", uid, profile.get("best_slot"))
+
+
+# ---------- новости версии ----------
+# ANNOUNCE_VERSION в content.py меняется — каждый получает текст один раз:
+# кто есть в базе — сразу при старте, кто приходит позже — при первом контакте.
+
+async def maybe_announce(uid: int):
+    if not C.ANNOUNCE_VERSION:
+        return
+    u = user_row(uid)
+    if not u or u["announced"] == C.ANNOUNCE_VERSION:
+        return
+    with db() as conn:
+        conn.execute("UPDATE users SET announced=? WHERE user_id=?", (C.ANNOUNCE_VERSION, uid))
+    await notify(uid, C.ANNOUNCE)
+
+
+async def announce_all():
+    if not C.ANNOUNCE_VERSION:
+        return
+    with db() as conn:
+        ids = [r["user_id"] for r in conn.execute(
+            "SELECT user_id FROM users WHERE announced != ?", (C.ANNOUNCE_VERSION,)).fetchall()]
+    for uid in ids:
+        if allowed(uid):
+            await maybe_announce(uid)
+    log.info("announce %s sent to %s", C.ANNOUNCE_VERSION, len(ids))
 
 
 def get_pack(u) -> dict:
@@ -562,6 +768,7 @@ async def api_state(request):
     if err is not None:
         return err
     add_event(res[0], "open")  # когда человек заходит — пригодится, чтобы понять, что его зовёт
+    asyncio.create_task(maybe_announce(res[0]))
     return web.json_response(state_payload(res[0]))
 
 
@@ -571,7 +778,7 @@ async def make_pack_for(uid: int, gid: int):
     if not g or not u:
         return
     if os.environ.get("ANTHROPIC_API_KEY"):
-        pack, usage = await build_pack(g["goal"], g["vision"], u["gender"])
+        pack, usage = await build_pack(g["goal"], g["vision"], u["gender"], u["why"])
         save_usage(uid, "pack", usage)
     else:
         pack = (pack_by_key(g["track"])                     # выбранное направление
@@ -705,12 +912,14 @@ async def cmd_start(m: Message):
         await m.answer(f"Доступ закрыт. Твой ID: <code>{m.from_user.id}</code>")
         return
     ensure_user(m.from_user.id, m.from_user.first_name or "")
+    tail = ("\n\nМожно просто написать сюда, чего хочется, — помогу сформулировать цель. "
+            "Или открой приложение и напиши сам." if agent.enabled() else "\n\nОткрой и напиши цель.")
     await m.answer(
         "Опора.\n\nЦель — одна или до трёх, несколько коротких действий в день и пара слов "
-        "тогда, когда они нужны. Верить ни во что не надо — надо отмечать сделанное.\n\n"
-        "Открой и напиши цель.",
+        "тогда, когда они нужны. Верить ни во что не надо — надо отмечать сделанное." + tail,
         reply_markup=kb(),
     )
+    await maybe_announce(m.from_user.id)
 
 
 @dp.message(Command("day"))
@@ -814,6 +1023,31 @@ async def cmd_refresh(m: Message):
     await m.answer(phrase_of_day(uid, user_row(uid), False), reply_markup=kb())
 
 
+@dp.message(F.voice | F.audio | F.video_note)
+async def on_voice(m: Message):
+    if allowed(m.from_user.id):
+        await m.answer("Голосовые пока не разбираю — напиши текстом, я здесь.")
+
+
+@dp.message(F.text & ~F.text.startswith("/"))
+async def on_text(m: Message):
+    """Любой текст — разговор. Без ключа — короткая подсказка."""
+    uid = m.from_user.id
+    if not allowed(uid):
+        return
+    ensure_user(uid, m.from_user.first_name or "")
+    if not agent.enabled():
+        await m.answer(C.NO_AI, reply_markup=kb())
+        return
+    try:
+        await bot.send_chat_action(m.chat.id, "typing")
+        text, new_goals = await chat_reply(uid, m.text)
+    except Exception as exc:
+        log.warning("chat %s: %s", uid, exc)
+        text, new_goals = "Что-то сбилось у меня. Напиши ещё раз через минуту.", False
+    await m.answer(html.escape(text), reply_markup=kb() if new_goals else None)
+
+
 # ---------- уведомления ----------
 
 async def notify(uid: int, text: str):
@@ -856,6 +1090,15 @@ async def reminders():
                 uid = u["user_id"]
                 if not allowed(uid) or push_sent(uid, slot, day) or has_event(uid, "mute", 3):
                     continue
+                if slot == "morning" and now.weekday() == 0 and not has_event(uid, "profile", 0):
+                    add_event(uid, "profile")  # понедельник: разбор недели, один раз в день
+                    try:
+                        await weekly_profile(uid)
+                    except Exception as exc:
+                        log.warning("profile %s: %s", uid, exc)
+                    u = user_row(uid)
+                if slot == "morning" and u["quiet_morning"]:
+                    continue  # утренние этот человек не открывает — не шумим
                 low = in_low(uid)
                 pack = get_pack(u)
                 if slot == "morning":
@@ -881,11 +1124,22 @@ async def main():
             )
         except Exception as exc:
             log.warning("menu button: %s", exc)
+    try:
+        await bot.set_my_commands([
+            BotCommand(command="day", description="сегодняшний день"),
+            BotCommand(command="stats", description="серия и цели"),
+            BotCommand(command="nedelya", description="оглянуться на неделю"),
+            BotCommand(command="frazy", description="пересобрать фразы под цель"),
+            BotCommand(command="tikho", description="тишина на три дня"),
+        ])
+    except Exception as exc:
+        log.warning("commands: %s", exc)
     runner = web.AppRunner(make_app())
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", PORT).start()
     log.info("web on :%s", PORT)
     asyncio.create_task(reminders())
+    asyncio.create_task(announce_all())
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
