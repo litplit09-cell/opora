@@ -25,7 +25,7 @@ from aiogram.types import (
 )
 
 import content as C
-from generator import build_pack
+from generator import build_pack, cost_usd
 from packs import match_pack, pack_by_key, DIRECTIONS
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -36,6 +36,7 @@ WEBAPP_URL = os.environ.get("WEBAPP_URL", "").rstrip("/")
 PORT = int(os.environ.get("PORT", "8080"))
 TZ = ZoneInfo(os.environ.get("TZ_NAME", "Europe/Moscow"))
 ALLOWED_IDS = {int(x) for x in os.environ.get("ALLOWED_IDS", "").replace(" ", "").split(",") if x}
+OWNER_ID = int(os.environ.get("OWNER_ID", "0") or 0)  # кому доступна /lyudi
 DB_PATH = os.environ.get("DB_PATH") or ("/data/opora.db" if Path("/data").is_dir() else "opora.db")
 
 DAY_GOAL = int(os.environ.get("DAY_GOAL", "3"))
@@ -82,6 +83,10 @@ def init_db():
             CREATE TABLE IF NOT EXISTS archive (
                 user_id INTEGER, goal TEXT, started_at TEXT,
                 finished_at TEXT, days INTEGER, marks INTEGER
+            );
+            CREATE TABLE IF NOT EXISTS usage (
+                user_id INTEGER, day TEXT, kind TEXT, model TEXT,
+                tokens_in INTEGER, tokens_out INTEGER, usd REAL
             );
             """
         )
@@ -193,6 +198,19 @@ def count_events(uid: int, *kinds) -> int:
         return conn.execute(
             f"SELECT COUNT(*) c FROM events WHERE user_id=? AND kind IN ({q})", (uid, *kinds)
         ).fetchone()["c"]
+
+
+def save_usage(uid: int, kind: str, usage: dict):
+    """Каждое обращение к Claude — строка в базе: потом видно, сколько стоит человек."""
+    if not usage:
+        return
+    usd = cost_usd(usage["model"], usage["tokens_in"], usage["tokens_out"])
+    with db() as conn:
+        conn.execute(
+            "INSERT INTO usage (user_id, day, kind, model, tokens_in, tokens_out, usd) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (uid, today(), kind, usage["model"], usage["tokens_in"], usage["tokens_out"], usd),
+        )
 
 
 def total_marks(uid: int) -> int:
@@ -365,6 +383,7 @@ async def api_state(request):
     res, err = await auth(request)
     if err is not None:
         return err
+    add_event(res[0], "open")  # когда человек заходит — пригодится, чтобы понять, что его зовёт
     return web.json_response(state_payload(res[0]))
 
 
@@ -374,7 +393,8 @@ async def make_pack_for(uid: int):
     if not u or not u["goal"]:
         return
     if os.environ.get("ANTHROPIC_API_KEY"):
-        pack = await build_pack(u["goal"], u["vision"], u["gender"])
+        pack, usage = await build_pack(u["goal"], u["vision"], u["gender"])
+        save_usage(uid, "pack", usage)
     else:
         pack = (pack_by_key(u["track"])                     # выбранное направление
                 or match_pack(u["goal"], u["vision"])       # запасной подбор по словам
@@ -522,6 +542,45 @@ async def cmd_stats(m: Message):
     )
 
 
+@dp.message(Command("lyudi"))
+async def cmd_people(m: Message):
+    """Сводка для владельца: сколько людей, насколько живые, сколько стоит ИИ."""
+    if not OWNER_ID or m.from_user.id != OWNER_ID:
+        return
+    d0 = datetime.now(TZ).date()
+    week, month = (d0 - timedelta(days=7)).isoformat(), d0.replace(day=1).isoformat()
+    labels = {d["key"]: d["label"] for d in DIRECTIONS}
+    with db() as conn:
+        total = conn.execute("SELECT COUNT(*) c FROM users").fetchone()["c"]
+        with_goal = conn.execute("SELECT user_id FROM users WHERE goal != ''").fetchall()
+        active = lambda since: conn.execute(
+            "SELECT COUNT(DISTINCT user_id) c FROM events WHERE kind='open' AND day>=?", (since,)
+        ).fetchone()["c"]
+        today_n, week_n = active(d0.isoformat()), active(week)
+        new_week = conn.execute(
+            "SELECT COUNT(*) c FROM (SELECT user_id, MIN(day) d FROM events GROUP BY user_id) WHERE d>=?",
+            (week,),
+        ).fetchone()["c"]
+        tracks = conn.execute(
+            "SELECT track, COUNT(*) c FROM users WHERE goal != '' GROUP BY track ORDER BY c DESC"
+        ).fetchall()
+        finished = conn.execute("SELECT COUNT(*) c FROM archive").fetchone()["c"]
+        spend = lambda since: conn.execute(
+            "SELECT COALESCE(SUM(usd),0) s, COUNT(*) n FROM usage WHERE day>=?", (since,)
+        ).fetchone()
+        sp_month, sp_all = spend(month), spend("0")
+    low_n = sum(1 for r in with_goal if in_low(r["user_id"]))
+    by_track = ", ".join(f"{labels.get(t['track'], t['track'] or '—')} {t['c']}" for t in tracks) or "—"
+    await m.answer(
+        f"Людей всего: <b>{total}</b>, с целью: {len(with_goal)}, целей закрыто: {finished}\n"
+        f"Заходили сегодня: {today_n}, за неделю: {week_n}, новых за неделю: {new_week}\n"
+        f"Сейчас на спаде: {low_n}\n"
+        f"По направлениям: {by_track}\n\n"
+        f"ИИ за месяц: ${sp_month['s']:.2f} ({sp_month['n']} запросов), "
+        f"всего: ${sp_all['s']:.2f} ({sp_all['n']})"
+    )
+
+
 @dp.message(Command("tikho"))
 async def cmd_quiet(m: Message):
     if not allowed(m.from_user.id):
@@ -555,37 +614,50 @@ async def notify(uid: int, text: str):
     await asyncio.sleep(0.05)
 
 
+SLOTS = {"morning": ((8, 30), (9, 0)), "evening": ((21, 0), (21, 30))}
+
+
+def current_slot(now: datetime):
+    for slot, (start, end) in SLOTS.items():
+        if start <= (now.hour, now.minute) < end:
+            return slot
+    return None
+
+
+def push_sent(uid: int, slot: str, day: str) -> bool:
+    with db() as conn:
+        return conn.execute(
+            "SELECT 1 FROM events WHERE user_id=? AND kind=? AND day=? LIMIT 1",
+            (uid, f"push:{slot}", day),
+        ).fetchone() is not None
+
+
 async def reminders():
-    """Не больше двух в день. Вечернее не приходит, если человек заходил сам."""
-    sent = set()
+    """Не больше двух в день. Отправленное помнится в базе, а не в памяти процесса —
+    перезапуск на Railway ничего не сбивает. Вечернее приходит, пока день не закрыт."""
     while True:
         now = datetime.now(TZ)
-        slot = None
-        if now.hour == 8 and 30 <= now.minute < 40:
-            slot = "morning"
-        elif now.hour == 21 and now.minute < 10:
-            slot = "evening"
+        slot = current_slot(now)
         if slot:
-            tag = f"{now.date()}:{slot}"
-            if tag not in sent:
-                sent = {tag}
-                with db() as conn:
-                    users = conn.execute("SELECT * FROM users WHERE goal != ''").fetchall()
-                for u in users:
-                    uid = u["user_id"]
-                    if not allowed(uid) or has_event(uid, "mute", 3):
-                        continue
-                    low = in_low(uid)
-                    pack = get_pack(u)
-                    if slot == "morning":
-                        text = phrase_of_day(uid, u, True) if low else pick(pack["morning"], uid, "morn")
-                        await notify(uid, text)
-                    else:
-                        if u["last_seen"] == today():
-                            continue
-                        items = C.PUSH_QUIET if low else pack["evening"]
-                        await notify(uid, pick(items, uid, "eve"))
-        await asyncio.sleep(240)
+            day = now.date().isoformat()
+            with db() as conn:
+                users = conn.execute("SELECT * FROM users WHERE goal != ''").fetchall()
+            for u in users:
+                uid = u["user_id"]
+                if not allowed(uid) or push_sent(uid, slot, day) or has_event(uid, "mute", 3):
+                    continue
+                low = in_low(uid)
+                pack = get_pack(u)
+                if slot == "morning":
+                    text = phrase_of_day(uid, u, True) if low else pick(pack["morning"], uid, "morn")
+                else:
+                    if marks_count(uid, day) >= (MIN_GOAL if low else DAY_GOAL):
+                        continue  # день уже закрыт — не дёргать
+                    text = pick(C.PUSH_QUIET if low else pack["evening"], uid, "eve")
+                add_event(uid, f"push:{slot}")  # до отправки: при сбое не долбить каждую минуту
+                await notify(uid, text)
+                log.info("push %s -> %s", slot, uid)
+        await asyncio.sleep(60)
 
 
 async def main():

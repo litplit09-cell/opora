@@ -19,8 +19,20 @@ import content as C
 log = logging.getLogger("opora.gen")
 
 API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
-MODEL = os.environ.get("CLAUDE_MODEL", "claude-haiku-4-5-20251001")
+MODEL = os.environ.get("CLAUDE_MODEL", "claude-opus-5")
 URL = "https://api.anthropic.com/v1/messages"
+
+# цена за миллион токенов, доллары — чтобы /lyudi показывала расход
+PRICES = {
+    "claude-opus-5": (5.0, 25.0),
+    "claude-sonnet-5": (2.0, 10.0),
+    "claude-haiku-4-5": (1.0, 5.0),
+}
+
+
+def cost_usd(model: str, tokens_in: int, tokens_out: int) -> float:
+    p_in, p_out = next((v for k, v in PRICES.items() if model.startswith(k)), (5.0, 25.0))
+    return (tokens_in * p_in + tokens_out * p_out) / 1_000_000
 
 PROMPT = """Ты пишешь короткие тексты для приложения-трекера «Опора». Человек идёт к своей цели \
 и получает не более двух уведомлений в день. Тексты должны снижать напряжение, а не подгонять.
@@ -71,15 +83,16 @@ def _validate(data: dict) -> dict:
     return out
 
 
-async def build_pack(goal: str, vision: str, gender: str) -> dict:
-    """Возвращает персональный пак фраз. При любой ошибке — запасной."""
+async def build_pack(goal: str, vision: str, gender: str) -> tuple[dict, dict]:
+    """Возвращает (персональный пак, usage). При любой ошибке — запасной пак и пустой usage.
+    usage: {"model", "tokens_in", "tokens_out"} — бот пишет это в базу для учёта расходов."""
     if not API_KEY:
         log.info("нет ANTHROPIC_API_KEY, работаем на запасном паке")
-        return dict(C.FALLBACK_PACK)
+        return dict(C.FALLBACK_PACK), {}
 
     body = {
         "model": MODEL,
-        "max_tokens": 4000,
+        "max_tokens": 12000,   # модель думает перед ответом, это тоже входит в лимит
         "messages": [{
             "role": "user",
             "content": PROMPT.format(
@@ -95,17 +108,25 @@ async def build_pack(goal: str, vision: str, gender: str) -> dict:
         "content-type": "application/json",
     }
     try:
-        timeout = aiohttp.ClientTimeout(total=90)
+        timeout = aiohttp.ClientTimeout(total=180)
         async with aiohttp.ClientSession(timeout=timeout) as s:
             async with s.post(URL, json=body, headers=headers) as r:
                 if r.status != 200:
                     log.warning("api %s: %s", r.status, (await r.text())[:200])
-                    return dict(C.FALLBACK_PACK)
+                    return dict(C.FALLBACK_PACK), {}
                 data = await r.json()
+        u = data.get("usage", {})
+        usage = {"model": data.get("model", MODEL),
+                 "tokens_in": int(u.get("input_tokens", 0)),
+                 "tokens_out": int(u.get("output_tokens", 0))}
+        if data.get("stop_reason") == "refusal":
+            log.warning("модель отказалась отвечать: %s", data.get("stop_details"))
+            return dict(C.FALLBACK_PACK), usage
         text = "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text")
         pack = _validate(json.loads(_clean(text)))
-        log.info("пак собран: %s дневных фраз", len(pack["daily"]))
-        return pack
+        log.info("пак собран: %s дневных фраз, %s/%s токенов",
+                 len(pack["daily"]), usage["tokens_in"], usage["tokens_out"])
+        return pack, usage
     except Exception as exc:
         log.warning("генерация не удалась: %s", exc)
-        return dict(C.FALLBACK_PACK)
+        return dict(C.FALLBACK_PACK), {}

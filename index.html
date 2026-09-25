@@ -25,7 +25,7 @@
       radial-gradient(130% 90% at 50% 104%, #D9B7C0 0%, rgba(217,183,192,0) 62%),
       linear-gradient(170deg, var(--sand) 0%, var(--sky) 100%);
     background-attachment:fixed;
-    padding:22px 18px calc(110px + env(safe-area-inset-bottom));
+    padding:22px 18px calc(36px + env(safe-area-inset-bottom));
     max-width:560px;margin:0 auto;
   }
   button,input,textarea{font-family:inherit;color:inherit}
@@ -84,8 +84,10 @@
   }
   .pill.sel{background:var(--ink);color:var(--sand);border-color:var(--ink)}
   .pill.wide{display:block;width:100%;text-align:center;background:var(--ink);color:var(--sand);border-color:var(--ink);padding:16px}
-  .quiet{display:block;width:100%;text-align:center;background:none;border:none;color:var(--muted);
-    font-size:13.5px;padding:10px;cursor:pointer;text-decoration:underline}
+  .quiet{display:inline-block;background:none;border:none;color:var(--muted);
+    font-size:13.5px;padding:8px 6px;cursor:pointer;text-decoration:underline;text-underline-offset:3px}
+  .foot{display:flex;justify-content:center;flex-wrap:wrap;gap:4px 18px;margin-top:10px}
+  .today .quiet{padding:10px 0 0;font-size:13px}
 
   /* настройка */
   .setup h1{font-family:'Prata',serif;font-weight:400;font-size:26px;line-height:1.25;margin:0 0 8px}
@@ -102,14 +104,7 @@
   .chips.wrap .pill{padding:10px 17px;font-size:14.5px}
   .steplbl{font-family:'Prata',serif;font-size:14px;color:var(--muted);margin:0 0 10px 6px}
 
-  /* SOS */
-  .sos-btn{
-    position:fixed;left:50%;transform:translateX(-50%);
-    bottom:calc(22px + env(safe-area-inset-bottom));
-    background:var(--ink);color:var(--sand);border:none;border-radius:999px;
-    padding:15px 30px;font-size:15px;font-weight:500;cursor:pointer;
-    box-shadow:0 10px 30px rgba(61,46,44,.28);z-index:5;
-  }
+  /* минута тишины — открывается по тихой ссылке, кнопки поверх экрана нет */
   .sheet{
     position:fixed;inset:0;z-index:10;display:none;flex-direction:column;
     align-items:center;justify-content:center;text-align:center;padding:34px;
@@ -151,6 +146,10 @@ async function api(path, body = {}) {
 }
 
 /* ---------- настройка ---------- */
+const dir = () => (s.directions || []).find(d => d.key === draft.track);
+const goalHint = () => dir() ? `Например: ${dir().example}` : "Своими словами, в настоящем времени";
+const visionHint = () => dir() ? `Например: ${dir().vision}` : "Одна картинка из того дня";
+
 function renderSetup() {
   document.getElementById("app").innerHTML = `
     <p class="mark">ОПОРА</p>
@@ -168,11 +167,11 @@ function renderSetup() {
 
       <div class="glass field">
         <label>Цель — одной строкой, как будто уже случилось</label>
-        <textarea id="goal" rows="2" maxlength="200" placeholder="Например: своя литейка работает"></textarea>
+        <textarea id="goal" rows="2" maxlength="200" placeholder="${esc(goalHint())}"></textarea>
       </div>
       <div class="glass field">
         <label>Что ты увидишь в этот день? Одна деталь</label>
-        <textarea id="vision" rows="2" maxlength="200" placeholder="Например: первая плавка, гул печи"></textarea>
+        <textarea id="vision" rows="2" maxlength="200" placeholder="${esc(visionHint())}"></textarea>
       </div>
       <p class="steplbl">Обращение</p>
       <div class="chips">
@@ -186,6 +185,8 @@ function renderSetup() {
   document.querySelectorAll(".d").forEach(b => b.onclick = () => {
     draft.track = b.dataset.d;
     document.querySelectorAll(".d").forEach(x => x.classList.toggle("sel", x === b));
+    document.getElementById("goal").placeholder = goalHint();      // пример под выбранное направление
+    document.getElementById("vision").placeholder = visionHint();
   });
   document.querySelectorAll(".g").forEach(b => b.onclick = () => {
     draft.gender = b.dataset.g;
@@ -230,6 +231,7 @@ function renderDay() {
     <div class="glass today">
       <p class="tag">${s.low ? "сегодня без планки" : "мысль дня"}</p>
       <p>${esc(s.phrase)}</p>
+      ${s.low ? `<button class="quiet sos-open">минута тишины, если нужна</button>` : ""}
     </div>
 
     <div class="glass goal">
@@ -243,9 +245,11 @@ function renderDay() {
     <div class="strip">${strip}</div>
     ${parts}
 
-    <button class="quiet" id="hard">мне сейчас тяжело</button>
-    <button class="quiet" id="fin">цель достигнута</button>
-    <button class="sos-btn" id="sos">Минута тишины</button>
+    <div class="foot">
+      <button class="quiet" id="hard">сегодня не идёт</button>
+      <button class="quiet sos-open">нужна опора</button>
+      <button class="quiet" id="fin">цель достигнута</button>
+    </div>
 
     <div class="sheet" id="sheet">
       <div class="breath"></div>
@@ -281,7 +285,7 @@ function wire() {
     try { s = await api("/api/finish"); render(); } catch (e) {}
   };
 
-  document.getElementById("sos").onclick = () => runSos();
+  document.querySelectorAll(".sos-open").forEach(b => b.onclick = () => runSos());
   document.getElementById("sclose").onclick = () => closeSos();
 }
 
