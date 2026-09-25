@@ -41,6 +41,7 @@ DB_PATH = os.environ.get("DB_PATH") or ("/data/opora.db" if Path("/data").is_dir
 
 DAY_GOAL = int(os.environ.get("DAY_GOAL", "3"))
 MIN_GOAL = 1  # планка в дни спада
+MAX_GOALS = 3  # целей одновременно; одна из них главная — её слова задают фразы дня
 
 bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
@@ -88,6 +89,12 @@ def init_db():
                 user_id INTEGER, day TEXT, kind TEXT, model TEXT,
                 tokens_in INTEGER, tokens_out INTEGER, usd REAL
             );
+            CREATE TABLE IF NOT EXISTS goals (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id     INTEGER, track TEXT DEFAULT '', goal TEXT, vision TEXT DEFAULT '',
+                pack        TEXT DEFAULT '', started_at TEXT, is_main INTEGER DEFAULT 0,
+                finished_at TEXT DEFAULT ''
+            );
             """
         )
         have = {r[1] for r in conn.execute("PRAGMA table_info(users)")}
@@ -96,6 +103,14 @@ def init_db():
                           ("vision", "TEXT DEFAULT ''"), ("runs", "INTEGER DEFAULT 0")):
             if col not in have:
                 conn.execute(f"ALTER TABLE users ADD COLUMN {col} {decl}")
+        # у кого цель лежала только в users (старая схема) — переносим в goals как главную
+        for u in conn.execute("SELECT * FROM users WHERE goal != ''").fetchall():
+            if not conn.execute("SELECT 1 FROM goals WHERE user_id=?", (u["user_id"],)).fetchone():
+                conn.execute(
+                    "INSERT INTO goals (user_id, track, goal, vision, pack, started_at, is_main) "
+                    "VALUES (?,?,?,?,?,?,1)",
+                    (u["user_id"], u["track"], u["goal"], u["vision"], u["pack"], u["started_at"]),
+                )
     log.info("db ready at %s", DB_PATH)
 
 
@@ -114,21 +129,111 @@ def ensure_user(uid: int, name: str = ""):
         conn.execute("UPDATE users SET last_seen=? WHERE user_id=?", (today(), uid))
 
 
-def start_goal(uid: int, track: str, goal: str, vision: str, gender: str):
+# ---------- цели ----------
+# Все цели лежат в goals. Колонки users.goal/track/vision/pack/started_at — зеркало
+# главной цели: старый код (фразы дня, уведомления, /stats) читает оттуда и не знает
+# о нескольких целях. Зеркало обновляет mirror_main после любой правки goals.
+
+def user_goals(uid: int) -> list:
     with db() as conn:
+        return conn.execute(
+            "SELECT * FROM goals WHERE user_id=? AND finished_at='' ORDER BY is_main DESC, id",
+            (uid,),
+        ).fetchall()
+
+
+def goal_row(uid: int, gid: int):
+    with db() as conn:
+        return conn.execute(
+            "SELECT * FROM goals WHERE user_id=? AND id=? AND finished_at=''", (uid, gid)
+        ).fetchone()
+
+
+def mirror_main(conn, uid: int):
+    g = conn.execute(
+        "SELECT * FROM goals WHERE user_id=? AND finished_at='' AND is_main=1", (uid,)
+    ).fetchone()
+    if g:
         conn.execute(
-            "UPDATE users SET track=?, goal=?, vision=?, gender=?, pack='', started_at=?, "
-            "runs=runs+1 WHERE user_id=?",
-            (track, goal[:200], vision[:200], gender, today(), uid),
+            "UPDATE users SET track=?, goal=?, vision=?, pack=?, started_at=? WHERE user_id=?",
+            (g["track"], g["goal"], g["vision"], g["pack"], g["started_at"], uid),
+        )
+    else:
+        conn.execute(
+            "UPDATE users SET track='', goal='', vision='', pack='', started_at='' WHERE user_id=?",
+            (uid,),
         )
 
 
-def save_pack(uid: int, pack: dict):
+def add_goal(uid: int, track: str, goal: str, vision: str, gender: str | None):
+    """Новая цель. Первая становится главной. Больше MAX_GOALS — None."""
+    with db() as conn:
+        n = conn.execute(
+            "SELECT COUNT(*) c FROM goals WHERE user_id=? AND finished_at=''", (uid,)
+        ).fetchone()["c"]
+        if n >= MAX_GOALS:
+            return None
+        cur = conn.execute(
+            "INSERT INTO goals (user_id, track, goal, vision, started_at, is_main) VALUES (?,?,?,?,?,?)",
+            (uid, track, goal[:200], vision[:200], today(), 1 if n == 0 else 0),
+        )
+        conn.execute("UPDATE users SET runs=runs+1 WHERE user_id=?", (uid,))
+        if gender:
+            conn.execute("UPDATE users SET gender=? WHERE user_id=?", (gender, uid))
+        mirror_main(conn, uid)
+        return cur.lastrowid
+
+
+def set_main(uid: int, gid: int) -> bool:
+    with db() as conn:
+        if not conn.execute(
+            "SELECT 1 FROM goals WHERE user_id=? AND id=? AND finished_at=''", (uid, gid)
+        ).fetchone():
+            return False
+        conn.execute("UPDATE goals SET is_main=0 WHERE user_id=?", (uid,))
+        conn.execute("UPDATE goals SET is_main=1 WHERE id=?", (gid,))
+        mirror_main(conn, uid)
+        return True
+
+
+def save_pack(uid: int, gid: int, pack: dict):
     with db() as conn:
         conn.execute(
-            "UPDATE users SET pack=? WHERE user_id=?",
-            (json.dumps(pack, ensure_ascii=False), uid),
+            "UPDATE goals SET pack=? WHERE id=?", (json.dumps(pack, ensure_ascii=False), gid)
         )
+        mirror_main(conn, uid)
+
+
+def finish_goal(uid: int, gid: int):
+    """Закрыть одну цель. Если она была главной — главной становится следующая."""
+    g = goal_row(uid, gid)
+    if not g:
+        return None
+    days = 1
+    if g["started_at"]:
+        days = (datetime.now(TZ).date() - datetime.fromisoformat(g["started_at"]).date()).days + 1
+    marks, hard = total_marks(uid), count_events(uid, "hard", "sos")
+    with db() as conn:
+        conn.execute(
+            "INSERT INTO archive (user_id, goal, started_at, finished_at, days, marks) "
+            "VALUES (?,?,?,?,?,?)",
+            (uid, g["goal"], g["started_at"], today(), days, marks),
+        )
+        conn.execute("UPDATE goals SET finished_at=?, is_main=0 WHERE id=?", (today(), gid))
+        if g["is_main"]:
+            nxt = conn.execute(
+                "SELECT id FROM goals WHERE user_id=? AND finished_at='' ORDER BY id LIMIT 1", (uid,)
+            ).fetchone()
+            if nxt:
+                conn.execute("UPDATE goals SET is_main=1 WHERE id=?", (nxt["id"],))
+        mirror_main(conn, uid)
+    return {"goal": g["goal"], "days": days, "marks": marks, "hard": hard}
+
+
+def days_since(day: str) -> int:
+    if not day:
+        return 1
+    return (datetime.now(TZ).date() - datetime.fromisoformat(day).date()).days + 1
 
 
 def get_pack(u) -> dict:
@@ -341,9 +446,10 @@ async def health(request):
 
 def state_payload(uid: int) -> dict:
     u = user_row(uid)
-    if not u["goal"]:
+    goals = user_goals(uid)
+    if not goals:
         return {"setup": True, "name": u["name"], "again": u["runs"] > 0,
-                "directions": DIRECTIONS}
+                "directions": DIRECTIONS, "maxGoals": MAX_GOALS}
     low = in_low(uid)
     goal_n = MIN_GOAL if low else DAY_GOAL
     e = day_entries(uid, today())
@@ -359,6 +465,10 @@ def state_payload(uid: int) -> dict:
         "name": u["name"],
         "goal": u["goal"],
         "vision": u["vision"],
+        "goals": [{"id": g["id"], "goal": g["goal"], "track": g["track"],
+                   "main": bool(g["is_main"]), "days": days_since(g["started_at"])} for g in goals],
+        "maxGoals": MAX_GOALS,
+        "directions": DIRECTIONS,
         "practices": practices,
         "partTitles": C.PART_TITLES,
         "marks": {k: True for k in PRACTICE_KEYS if e.get(k) == "1"},
@@ -387,23 +497,24 @@ async def api_state(request):
     return web.json_response(state_payload(res[0]))
 
 
-async def make_pack_for(uid: int):
-    """С ключом — персональная генерация. Без ключа — готовый пак по словам цели."""
-    u = user_row(uid)
-    if not u or not u["goal"]:
+async def make_pack_for(uid: int, gid: int):
+    """С ключом — персональная генерация под эту цель. Без ключа — готовый пак направления."""
+    g, u = goal_row(uid, gid), user_row(uid)
+    if not g or not u:
         return
     if os.environ.get("ANTHROPIC_API_KEY"):
-        pack, usage = await build_pack(u["goal"], u["vision"], u["gender"])
+        pack, usage = await build_pack(g["goal"], g["vision"], u["gender"])
         save_usage(uid, "pack", usage)
     else:
-        pack = (pack_by_key(u["track"])                     # выбранное направление
-                or match_pack(u["goal"], u["vision"])       # запасной подбор по словам
+        pack = (pack_by_key(g["track"])                     # выбранное направление
+                or match_pack(g["goal"], g["vision"])       # запасной подбор по словам
                 or dict(C.FALLBACK_PACK))
-    save_pack(uid, pack)
-    log.info("pack ready for %s", uid)
+    save_pack(uid, gid, pack)
+    log.info("pack ready for %s / goal %s", uid, gid)
 
 
 async def api_setup(request):
+    """Первая цель или ещё одна — один и тот же вход."""
     res, err = await auth(request)
     if err is not None:
         return err
@@ -411,13 +522,25 @@ async def api_setup(request):
     goal = (body.get("goal") or "").strip()
     if len(goal) < 3:
         return web.json_response({"error": "empty_goal"}, status=400)
-    gender = body.get("gender") if body.get("gender") in ("f", "m", "n") else "n"
-    track = body.get("track") or ""
-    start_goal(uid, track, goal, (body.get("vision") or "").strip(), gender)
+    gender = body.get("gender") if body.get("gender") in ("f", "m", "n") else None
+    gid = add_goal(uid, body.get("track") or "", goal, (body.get("vision") or "").strip(), gender)
+    if gid is None:
+        return web.json_response({"error": "too_many"}, status=400)
     if os.environ.get("ANTHROPIC_API_KEY"):
-        asyncio.create_task(make_pack_for(uid))   # фразы догонят через несколько секунд
+        asyncio.create_task(make_pack_for(uid, gid))   # фразы догонят через несколько секунд
     else:
-        await make_pack_for(uid)                  # готовый пак подставляется сразу
+        await make_pack_for(uid, gid)                  # готовый пак подставляется сразу
+    return web.json_response(state_payload(uid))
+
+
+async def api_main(request):
+    """Сделать цель главной — её слова станут фразами дня."""
+    res, err = await auth(request)
+    if err is not None:
+        return err
+    uid, body = res
+    if not set_main(uid, int(body.get("id") or 0)):
+        return web.json_response({"error": "unknown_goal"}, status=400)
     return web.json_response(state_payload(uid))
 
 
@@ -458,24 +581,17 @@ async def api_finish(request):
     res, err = await auth(request)
     if err is not None:
         return err
-    uid, _ = res
-    u = user_row(uid)
-    if not u["goal"]:
+    uid, body = res
+    gid = int(body.get("id") or 0)
+    if not gid:  # без id — закрываем главную
+        main = next((g for g in user_goals(uid) if g["is_main"]), None)
+        gid = main["id"] if main else 0
+    done = finish_goal(uid, gid)
+    if not done:
         return web.json_response({"error": "no_goal"}, status=400)
-    days = 1
-    if u["started_at"]:
-        days = (datetime.now(TZ).date() - datetime.fromisoformat(u["started_at"]).date()).days + 1
-    marks = total_marks(uid)
-    hard = count_events(uid, "hard", "sos")
-    with db() as conn:
-        conn.execute(
-            "INSERT INTO archive (user_id, goal, started_at, finished_at, days, marks) "
-            "VALUES (?,?,?,?,?,?)",
-            (uid, u["goal"], u["started_at"], today(), days, marks),
-        )
-        conn.execute("UPDATE users SET goal='', vision='', pack='' WHERE user_id=?", (uid,))
+    tail = C.FINISH_TAIL_MORE if user_goals(uid) else C.FINISH_TAIL_NONE
     try:
-        await bot.send_message(uid, C.FINISH.format(goal=u["goal"], days=days, marks=marks, hard=hard))
+        await bot.send_message(uid, C.FINISH.format(**done) + tail)
     except Exception as exc:
         log.warning("finish msg: %s", exc)
     return web.json_response(state_payload(uid))
@@ -488,6 +604,7 @@ def make_app():
     for path, handler in (
         ("/api/state", api_state), ("/api/setup", api_setup), ("/api/toggle", api_toggle),
         ("/api/note", api_note), ("/api/event", api_event), ("/api/finish", api_finish),
+        ("/api/main", api_main),
     ):
         app.router.add_post(path, handler)
     return app
@@ -510,8 +627,9 @@ async def cmd_start(m: Message):
         return
     ensure_user(m.from_user.id, m.from_user.first_name or "")
     await m.answer(
-        "Опора.\n\nОдна цель, несколько коротких действий в день и пара слов тогда, когда они "
-        "нужны. Верить ни во что не надо — надо отмечать сделанное.\n\nОткрой и напиши цель.",
+        "Опора.\n\nЦель — одна или до трёх, несколько коротких действий в день и пара слов "
+        "тогда, когда они нужны. Верить ни во что не надо — надо отмечать сделанное.\n\n"
+        "Открой и напиши цель.",
         reply_markup=kb(),
     )
 
@@ -529,14 +647,16 @@ async def cmd_stats(m: Message):
     if not allowed(uid):
         return
     ensure_user(uid, m.from_user.first_name or "")
-    u = user_row(uid)
-    if not u["goal"]:
+    goals = user_goals(uid)
+    if not goals:
         await m.answer("Цель ещё не выбрана.", reply_markup=kb())
         return
     goal_n = MIN_GOAL if in_low(uid) else DAY_GOAL
     bar = "".join("●" if d["count"] >= goal_n else ("◐" if d["count"] else "○") for d in history(uid))
+    lines = "\n".join(f"{'●' if g['is_main'] else '○'} {g['goal']} · {days_since(g['started_at'])} дн."
+                      for g in goals)
     await m.answer(
-        f"{u['goal']}\n\nСерия: <b>{streak(uid, goal_n)}</b> дн. · всего отметок: {total_marks(uid)}\n"
+        f"{lines}\n\nСерия: <b>{streak(uid, goal_n)}</b> дн. · всего отметок: {total_marks(uid)}\n"
         f"<code>{bar}</code>",
         reply_markup=kb(),
     )
@@ -595,12 +715,12 @@ async def cmd_refresh(m: Message):
     uid = m.from_user.id
     if not allowed(uid):
         return
-    u = user_row(uid)
-    if not u or not u["goal"]:
+    main = next((g for g in user_goals(uid) if g["is_main"]), None)
+    if not main:
         await m.answer("Сначала нужна цель.", reply_markup=kb())
         return
     await m.answer("Собираю новые фразы под твою цель, минуту.")
-    await make_pack_for(uid)
+    await make_pack_for(uid, main["id"])
     await m.answer(phrase_of_day(uid, user_row(uid), False), reply_markup=kb())
 
 

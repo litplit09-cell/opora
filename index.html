@@ -44,10 +44,14 @@
   .today .tag{font-size:12.5px;color:var(--muted);margin:0 0 10px;letter-spacing:.04em}
 
   /* цель */
-  .goal{padding:18px 22px;margin-bottom:18px;display:flex;gap:14px;align-items:center}
+  .goal{padding:18px 22px;margin-bottom:18px}
+  .goal .top{display:flex;gap:14px;align-items:center}
   .goal .txt{flex:1}
   .goal h1{font-family:'Prata',serif;font-weight:400;font-size:18px;line-height:1.3;margin:0}
   .goal small{display:block;color:var(--muted);font-size:12.5px;margin-top:4px}
+  .goal .others{display:flex;flex-wrap:wrap;gap:7px;margin-top:12px}
+  .goal .others .pill{padding:7px 13px;font-size:13px;background:rgba(255,255,255,.35)}
+  .goal .others .pill.add{color:var(--muted);border-style:dashed}
   .count{font-family:'Prata',serif;font-size:30px;color:var(--clay);line-height:1}
   .count em{display:block;font-style:normal;font-family:'Manrope';font-size:11px;color:var(--muted);text-align:center}
 
@@ -131,7 +135,7 @@
 <script>
 const tg = window.Telegram?.WebApp;
 const initData = tg?.initData || "";
-let s = null, draft = { gender: "n", track: "" };
+let s = null, draft = { gender: "n", track: "" }, adding = false;  // adding — форма «ещё одна цель» поверх дня
 if (tg) { tg.ready(); tg.expand(); }
 
 const esc = t => (t || "").replace(/[<>&"]/g, c => ({ "<":"&lt;", ">":"&gt;", "&":"&amp;", '"':"&quot;" }[c]));
@@ -151,13 +155,17 @@ const goalHint = () => dir() ? `Например: ${dir().example}` : "Свои�
 const visionHint = () => dir() ? `Например: ${dir().vision}` : "Одна картинка из того дня";
 
 function renderSetup() {
+  const title = adding ? "Ещё одна цель" : (s.again ? "Новая цель" : "С чего начнём");
+  const lead = adding
+    ? `Целей может быть до ${s.maxGoals}. Одна из них главная — её слова приходят в течение дня, переключить можно в любой момент.`
+    : (s.again
+        ? "Второй заход обычно идёт легче — ты уже знаешь, как это работает."
+        : "Приложение идёт с тобой, пока цель не будет достигнута. Потом можно добавить ещё одну или начать заново.");
   document.getElementById("app").innerHTML = `
     <p class="mark">ОПОРА</p>
     <div class="setup">
-      <h1>${s.again ? "Новая цель" : "Одна цель за раз"}</h1>
-      <p class="lead">${s.again
-        ? "Второй заход обычно идёт легче — ты уже знаешь, как это работает."
-        : "Приложение идёт с тобой, пока цель не будет достигнута. Потом можно начать заново."}</p>
+      <h1>${title}</h1>
+      <p class="lead">${lead}</p>
 
       <p class="steplbl">Куда идём</p>
       <div class="chips wrap">
@@ -173,14 +181,17 @@ function renderSetup() {
         <label>Что ты увидишь в этот день? Одна деталь</label>
         <textarea id="vision" rows="2" maxlength="200" placeholder="${esc(visionHint())}"></textarea>
       </div>
-      <p class="steplbl">Обращение</p>
+      ${adding ? "" : `<p class="steplbl">Обращение</p>
       <div class="chips">
         ${[["f","Ко мне — в женском"],["m","В мужском"],["n","Без разницы"]].map(([k,t]) =>
           `<button class="pill g ${draft.gender===k?"sel":""}" data-g="${k}">${t}</button>`).join("")}
-      </div>
-      <button class="pill wide" id="go">Начать</button>
-      <p class="lead" style="margin-top:14px;text-align:center">Направление задаёт слова, которые будут приходить. Цель — твоя, своими словами.</p>
+      </div>`}
+      <button class="pill wide" id="go">${adding ? "Добавить" : "Начать"}</button>
+      ${adding
+        ? `<div class="foot"><button class="quiet" id="back">вернуться к дню</button></div>`
+        : `<p class="lead" style="margin-top:14px;text-align:center">Направление задаёт слова, которые будут приходить. Цель — твоя, своими словами.</p>`}
     </div>`;
+  if (adding) document.getElementById("back").onclick = () => { adding = false; render(); };
 
   document.querySelectorAll(".d").forEach(b => b.onclick = () => {
     draft.track = b.dataset.d;
@@ -196,17 +207,28 @@ function renderSetup() {
     const goal = document.getElementById("goal").value.trim();
     if (!draft.track) { document.querySelector(".chips.wrap").scrollIntoView({ behavior: "smooth", block: "center" }); return; }
     if (goal.length < 3) { document.getElementById("goal").focus(); return; }
+    const body = { track: draft.track, goal, vision: document.getElementById("vision").value };
+    if (!adding) body.gender = draft.gender;   // род спрашиваем один раз, при первой цели
     try {
-      s = await api("/api/setup", {
-        track: draft.track, goal,
-        vision: document.getElementById("vision").value, gender: draft.gender });
+      s = await api("/api/setup", body);
+      adding = false; draft.track = "";
       render();
       setTimeout(refresh, 9000);   // подтянуть персональные фразы, когда соберутся
-    } catch (e) { alert("Не сохранилось, попробуй ещё раз"); }
+    } catch (e) { alert(e.message === "too_many" ? `Целей уже ${s.maxGoals} — это предел` : "Не сохранилось, попробуй ещё раз"); }
   };
 }
 
 /* ---------- день ---------- */
+// остальные цели — тихими кнопками под главной; тап делает цель главной
+function goalsRow() {
+  const others = s.goals.filter(g => !g.main);
+  if (!others.length && s.goals.length >= s.maxGoals) return "";
+  return `<div class="others">
+    ${others.map(g => `<button class="pill main-of" data-id="${g.id}">${esc(g.goal)}</button>`).join("")}
+    ${s.goals.length < s.maxGoals ? `<button class="pill add" id="add">+ ещё цель</button>` : ""}
+  </div>`;
+}
+
 function renderDay() {
   const done = Object.keys(s.marks).length;
   const strip = s.history.map((d, i) =>
@@ -235,11 +257,14 @@ function renderDay() {
     </div>
 
     <div class="glass goal">
-      <div class="txt">
-        <h1>${esc(s.goal)}</h1>
-        <small>${s.low ? "хватит одного пункта, серия сохранится" : `сегодня ${done} из ${s.practices.length}`}</small>
+      <div class="top">
+        <div class="txt">
+          <h1>${esc(s.goal)}</h1>
+          <small>${s.low ? "хватит одного пункта, серия сохранится" : `сегодня ${done} из ${s.practices.length}`}</small>
+        </div>
+        <div class="count">${s.streak}<em>дней</em></div>
       </div>
-      <div class="count">${s.streak}<em>дней</em></div>
+      ${goalsRow()}
     </div>
 
     <div class="strip">${strip}</div>
@@ -281,9 +306,18 @@ function wire() {
   };
 
   document.getElementById("fin").onclick = async () => {
-    if (!confirm("Закрыть эту цель? Итоги придут в чат, потом можно поставить новую.")) return;
+    const more = s.goals.length > 1;
+    if (!confirm(`Закрыть цель «${s.goal}»? Итоги придут в чат${more ? ", остальные цели останутся" : ", потом можно поставить новую"}.`)) return;
     try { s = await api("/api/finish"); render(); } catch (e) {}
   };
+
+  document.querySelectorAll(".main-of").forEach(b => b.onclick = async () => {
+    tg?.HapticFeedback?.selectionChanged?.();
+    try { s = await api("/api/main", { id: Number(b.dataset.id) }); render(); window.scrollTo({ top: 0, behavior: "smooth" }); }
+    catch (e) {}
+  });
+  const add = document.getElementById("add");
+  if (add) add.onclick = () => { adding = true; draft.track = ""; render(); window.scrollTo(0, 0); };
 
   document.querySelectorAll(".sos-open").forEach(b => b.onclick = () => runSos());
   document.getElementById("sclose").onclick = () => closeSos();
@@ -313,7 +347,7 @@ function closeSos() {
   refresh();
 }
 
-function render() { s.setup ? renderSetup() : renderDay(); }
+function render() { (s.setup || adding) ? renderSetup() : renderDay(); }
 async function refresh() { try { s = await api("/api/state"); render(); } catch (e) {} }
 
 (async () => {
