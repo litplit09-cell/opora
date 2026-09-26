@@ -1043,7 +1043,7 @@ async def on_text(m: Message):
         await bot.send_chat_action(m.chat.id, "typing")
         text, new_goals = await chat_reply(uid, m.text)
     except Exception as exc:
-        log.warning("chat %s: %s", uid, exc)
+        log.exception("chat %s failed: %r", uid, exc)  # полный след — чтобы по логам было видно, что именно
         text, new_goals = "Что-то сбилось у меня. Напиши ещё раз через минуту.", False
     await m.answer(html.escape(text), reply_markup=kb() if new_goals else None)
 

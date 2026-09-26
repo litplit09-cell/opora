@@ -89,8 +89,8 @@ TOOLS = [
             "type": "object",
             "properties": {
                 "goals": {
-                    "type": "array", "minItems": 1, "maxItems": 3,
-                    "items": {
+                    "type": "array",  # от одной до трёх — сказано в описании; строгая схема
+                    "items": {        # не любит minItems/maxItems
                         "type": "object",
                         "properties": {
                             "track": {"type": "string", "enum": TRACK_KEYS},
@@ -134,6 +134,22 @@ def _text(resp) -> str:
     return "\n".join(b.text for b in resp.content if b.type == "text").strip()
 
 
+async def _create(req: list, context: str):
+    """Запрос к модели. Контекст — сообщением role=system в хвосте; если модель или SDK
+    такое не принимают (400), повторяем с контекстом во втором блоке общего system —
+    кэш истории тогда сбрасывается, но разговор работает."""
+    system = [{"type": "text", "text": SYSTEM, "cache_control": {"type": "ephemeral"}}]
+    try:
+        return await client.messages.create(
+            model=MODEL, max_tokens=2000, system=system, tools=TOOLS, messages=req)
+    except anthropic.BadRequestError as exc:
+        log.warning("400, повторяю без system-сообщения в истории: %s", str(exc)[:300])
+        plain = [m for m in req if m["role"] != "system"]
+        return await client.messages.create(
+            model=MODEL, max_tokens=2000, tools=TOOLS, messages=plain,
+            system=system + [{"type": "text", "text": context}])
+
+
 async def reply(history: list, user_text: str, context: str, execute) -> tuple[str, list, dict]:
     """Один ход разговора.
 
@@ -154,13 +170,7 @@ async def reply(history: list, user_text: str, context: str, execute) -> tuple[s
         req = list(messages)  # точка кэша — на свежей реплике; в историю она не пишется
         req[len(history)] = {"role": "user", "content": [
             {"type": "text", "text": user_text, "cache_control": {"type": "ephemeral"}}]}
-        resp = await client.messages.create(
-            model=MODEL,
-            max_tokens=2000,
-            system=[{"type": "text", "text": SYSTEM, "cache_control": {"type": "ephemeral"}}],
-            tools=TOOLS,
-            messages=req,
-        )
+        resp = await _create(req, context)
         u = _usage(resp)
         usage_total["model"] = u["model"]
         usage_total["tokens_in"] += u["tokens_in"]
